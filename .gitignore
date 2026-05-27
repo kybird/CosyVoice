@@ -1,52 +1,41 @@
-# Byte-compiled / optimized / DLL files
+# ONNX models (too large for GitHub - ~5GB total)
+onnx_models/
+*.onnx
+
+# Generated audio outputs
+outputs/
+
+# Pretrained models (download separately)
+pretrained_models/
+
+# Python
 __pycache__/
-*.py[cod]
-*$py.class
+*.pyc
+*.pyo
+.eggs/
+*.egg-info/
+dist/
+build/
 
-# Visual Studio Code files
-.vscode
-.vs
-
-# PyCharm files
-.idea
-
-# Eclipse Project settings
-*.*project
-.settings
-
-# Sublime Text settings
-*.sublime-workspace
-*.sublime-project
-
-# Editor temporaries
-*.swn
-*.swo
+# IDE
+.vscode/
+.idea/
 *.swp
-*.swm
-*~
+*.swo
 
-# IPython notebook checkpoints
-.ipynb_checkpoints
-
-# macOS dir files
+# OS
+Thumbs.db
 .DS_Store
 
-exp
-data
-raw_wav
-tensorboard
-**/*build*
+# Conda / env
+.env
+*.egg
 
-# Clangd files
-.cache
-compile_commands.json
+# Temp / profiling
+dit_profile*
+*.json.bak
 
-# train/inference files
-*.wav
-*.m4a
-*.aac
-*.pt
-pretrained_models/*
-*_pb2_grpc.py
-*_pb2.py
-*.tar
+# Deploy secrets (NEVER commit)
+deploy/key.properties
+deploy/setup_keystore_env.bat
+deploy/*.jks
