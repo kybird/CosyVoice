@@ -851,3 +851,175 @@ onnx_models\
 
 > **참고**: CPU에서는 PHASE 2/3 그래프 최적화의 효과가 제한적 (1.18x single-call speedup). 
 > 진정한 이점은 **모바일 NPU (NNAPI/CoreML)** 에서 발생 — Shape/Gather 제거, Conv2D 네이티브, QKV fusion 메모리 대역폭 절감.
+
+---
+
+## 17. [2026-05-28] ORT 최적화 + INT8 양자화 + 최종 CPU RTF ~0.95
+
+### 17.1 ORT 1.18→1.23.2 업그레이드
+
+| 항목 | 이전 | 이후 |
+|------|------|------|
+| onnxruntime | 1.18.0 | 1.23.2 |
+| 주요 개선 | — | MLAS transformer fusion, thread scheduling 개선 |
+
+### 17.2 Thread Tuning (benchmark sweep 1~16 threads)
+
+| 컴포넌트 | 최적 intra_threads | 최적 inter_threads | 효과 |
+|----------|--------------------|--------------------|------|
+| LLM | 0 (all cores) | 1 | RTF 대폭 감소 |
+| Flow/DiT | 0 (all cores) | 1 | Flow RTF 1.619→0.343 (16t 기준 benchmark) |
+| HiFT | 0 (all cores) | 1 | |
+
+> `intra_op_num_threads=0` = 모든 코어 사용 (시스템이 자동 할당)
+
+### 17.3 SessionOptions 최적화
+
+```python
+opts = ort.SessionOptions()
+opts.intra_op_num_threads = 0       # 모든 코어
+opts.inter_op_num_threads = 1
+opts.enable_mem_pattern = True      # 반복 패턴 메모리 최적화
+opts.enable_mem_reuse = True        # 메모리 재사용
+opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+```
+
+### 17.4 Allocation Zero + In-place Euler
+
+ODE 루프 내 numpy 임시 할당 제거:
+
+```python
+# Before: 매 스텝 새 배열 할당
+x = x + dphi * dt
+
+# After: 사전 할당 + in-place 연산
+out = np.zeros_like(x)  # 한 번만 할당
+np.multiply(dphi, dt, out=out)
+np.add(x, out, out=x)   # in-place
+```
+
+### 17.5 FFN-only INT8 양자화 (채택)
+
+DiT 22블록의 FFN MatMul 44개만 INT8 양자화:
+
+| 항목 | 값 |
+|------|-----|
+| 타겟 노드 | `/ff/ff/ff.0/MatMul` [1024×2048] + `/ff/ff/ff.2/MatMul` [2048×1024] × 22 blocks |
+| 총 노드 수 | 44 |
+| 모델 크기 | 1265→1002 MB (−20.8%) |
+| 품질 | ✅ "음질괜찮다" 사용자 확인 |
+| 양자화 방식 | `quantize_dynamic()` + `nodes_to_quantify` 선택적 적용 |
+
+### 17.6 시도 후 롤백한 것들
+
+| 시도 | 결과 | 이유 |
+|------|------|------|
+| Full INT8 (112 nodes) | ❌ 롤백 | 잡음 심함 — diffusion 오차 누적 |
+| CFG 제거 (CFG scale=0) | ❌ 롤백 | "그럭저럭 들어줄만한데" — 품질 저하로 원복 |
+| QKV-only INT8 (22 nodes) | ⚠️ 미채택 | 속도 개선 미미 (870MB) |
+
+### 17.7 ODE Step 5→4
+
+| 항목 | 이전 | 이후 |
+|------|------|------|
+| N_TIMESTEPS | 5 | 4 |
+| DiT 호출 (CFG=ON, 배치=1) | 10회 | 8회 |
+| 품질 | — | ✅ "음질괜찮다" 사용자 확인 |
+
+### 17.8 CPU FP16 확인
+
+| 플랫폼 | Gemm/MatMul FP16 | 설명 |
+|--------|-------------------|------|
+| x86_64 (ORT CPU EP) | ❌ 미지원 | Eigen fallback only, 속도 이점 없음 |
+| ARM64 (모바일) | ✅ 네이티브 지원 | MLAS HGemM + NEON FP16 intrinsics |
+
+→ FP16 DiT (634MB)는 모바일 ARM64용 보관, x86에서는 사용 불가
+
+### 17.9 최종 CPU Inference RTF
+
+**환경: ORT 1.23.2, FFN INT8 DiT, ODE 4 steps, CFG ON, allocation zero**
+
+| 컴포넌트 | 시간 | RTF | 비고 |
+|----------|------|-----|------|
+| LLM (INT8) | 1.02s | 0.380 | 67토큰 autoregressive |
+| Flow/DiT (FFN INT8) | 1.27s | 0.474 | ODE 4 steps |
+| HiFT | 0.23s | 0.085 | |
+| **Inference RTF** | **2.52s** | **0.939** | **2.68초 오디오, 모델 로딩 제외 순수 추론** |
+
+> **Inference RTF = 0.939**: 실시간보다 빠름. 시작 RTF 2.45에서 **−62%** 개선.
+> 모델 로딩 포함 시 End-to-end RTF = 2.587 (로딩 1회만 발생).
+
+### 17.10 DiT 모델 파일 3종
+
+| 파일 | 크기 | 용도 |
+|------|------|------|
+| `dit_estimator_mobile.onnx` | 1265 MB | FP32 기본 (QKV fused, Batch=1) |
+| `dit_estimator_int8_ffn.onnx` | 1002 MB | **현재 사용** — FFN INT8 |
+| `dit_estimator_fp16.onnx` | 634 MB | 모바일 ARM64용 |
+
+### 17.11 스크립트 디렉토리 정리
+
+```
+export/                      — ONNX 익스포팅 스크립트
+├── export_qwen2_onnx.py       — LLM transformer
+├── export_llm_embed_onnx.py   — LLM embed + decoder
+├── export_dit_onnx.py         — 원본 DiT (Batch=2)
+├── export_dit_mobile.py       — DiT QKV fusion + Batch=1
+├── export_flow_prep_onnx.py   — Flow prep
+└── export_hift_onnx.py        — HiFT vocoder
+
+quantize/                    — 양자화 스크립트
+├── quantize_dit_ffn_int8.py   — FFN-only INT8 ✅ 채택
+├── quantize_dit_full_int8.py  — Full INT8 (참고용, 품질↓)
+└── quantize_dit_selective.py  — QKV-only INT8 (참고용)
+
+benchmark/                   — 벤치마크/테스트
+├── test_onnx_pipeline.py      — 전체 파이프라인 (FFN INT8 + ODE 4 + CFG ON)
+├── benchmark_ort_optimization.py — ORT profiling + thread sweep
+└── verify_runs.py              — 3회 연속 검증
+
+export_models.bat            — 원클릭 전체 모델 익스포트
+```
+
+### 17.12 GitHub 포크 완료
+
+| 항목 | 값 |
+|------|-----|
+| 포크 리포 | https://github.com/kybird/CosyVoice |
+| 브랜치 | `onnx-optimization` |
+| 커밋 | `39e86df` — 17 files, +5086 lines |
+| .gitignore | onnx_models/, pretrained_models/, outputs/, deploy 시크릿 제외 |
+| upstream | `FunAudioLLM/CosyVoice` (원본) |
+
+---
+
+## 18. 다음 단계 (모바일 포팅)
+
+### 18.1 Preprocessing PyTorch 제거 (필수)
+
+현재 PyTorch가 남은 곳:
+
+| 위치 | 연산 | 교체 방안 |
+|------|------|----------|
+| `load_wav()` | `torchaudio.load` + Resample | scipy.io.wavfile + scipy.signal.resample |
+| `extract_speech_tokens()` | `whisper.log_mel_spectrogram` (128-bin) | numpy STFT 기반 mel 직접 구현 |
+| `extract_speaker_embedding()` | `kaldi.fbank` (torchaudio, 80-bin) | numpy fbank 구현 |
+| `extract_prompt_speech_feat()` | `matcha.utils.audio.mel_spectrogram` (torch STFT, 80-bin) | numpy STFT 또는 ONNX |
+| 토크나이저 | `CosyVoice3Tokenizer` (transformers) | sentencepiece 또는 Dart 토크나이저 |
+| WAV 저장 | `torchaudio.save` | scipy.io.wavfile.write |
+
+> Flutter에서 numpy/PyTorch 불가 → 모든 연산을 ONNX 모델로 묶거나 Dart 네이티브로 구현 필요
+
+### 18.2 모바일 포팅 (Flutter + ONNX Runtime Mobile)
+
+- Flutter `onnxruntime` 패키지 사용
+- 모델 4종 로드: llm_embed(565MB) + llm_initial_int8(344MB) + llm_decode_int8(344MB) + dit_estimator_int8_ffn(1002MB) + flow_prep(4MB) + hift(327MB) = **~2.3GB**
+- ARM64에서 FP16 DiT(634MB) 사용 시 총 ~1.9GB
+
+### 18.3 모바일 ARM64 검증 항목
+
+- [ ] FP16 DiT + FFN INT8 조합 품질
+- [ ] 실시간 RTF 측정 (Snapdragon 8 Gen 2/3 기준)
+- [ ] 메모리 피크 사용량 (2.3GB 모델 로드)
+- [ ] NPU 위임 가능 여부 (NNAPI Delegate)
+ㅊ

@@ -826,8 +826,8 @@ def main():
     print("=" * 70)
 
     try:
-        t_llm_start = time.time()
         llm = LLMOnnxInference(MODEL_DIR, ONNX_DIR, use_int8=args.use_int8)
+        t_llm_start = time.time()
         speech_tokens = llm.run(preproc_data)
         timings["llm"] = time.time() - t_llm_start
 
@@ -851,8 +851,8 @@ def main():
     print("=" * 70)
 
     try:
-        t_flow_start = time.time()
         flow = FlowOnnxInference(MODEL_DIR, ONNX_DIR)
+        t_flow_start = time.time()
         mel_output = flow.run(
             speech_tokens=speech_tokens,
             prompt_tokens=preproc_data["speech_tokens"],
@@ -874,8 +874,8 @@ def main():
     print("=" * 70)
 
     try:
-        t_hift_start = time.time()
         hift = HiFTOnnxInference(ONNX_DIR)
+        t_hift_start = time.time()
         audio = hift.run(mel_output)
         timings["hift"] = time.time() - t_hift_start
     except Exception as e:
