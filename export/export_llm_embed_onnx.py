@@ -26,7 +26,7 @@ import logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("export_llm_embed")
 
-BASE_DIR = Path(r"C:\Project\TTSTextReader\CosyVoice")
+BASE_DIR = Path(r"D:\Project\TTSTextReader\CosyVoice")
 MODEL_DIR = BASE_DIR / "pretrained_models" / "Fun-CosyVoice3-0.5B"
 ONNX_DIR = BASE_DIR / "onnx_models"
 

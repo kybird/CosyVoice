@@ -19,7 +19,7 @@ REM ============================================================
 
 setlocal enabledelayedexpansion
 
-set PYTHON=C:\Users\kybir\.conda\envs\melotts\python.exe
+set PYTHON=C:\Users\admin\miniconda3\envs\melotts\python.exe
 set ROOT_DIR=%~dp0
 set ONNX_DIR=%ROOT_DIR%onnx_models
 set EXPORT_DIR=%ROOT_DIR%export

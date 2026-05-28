@@ -26,7 +26,7 @@ import torch.nn.functional as F
 
 # ─── Paths ───────────────────────────────────────────────────────────────────
 
-BASE_DIR = Path(r"C:\Project\TTSTextReader\CosyVoice")
+BASE_DIR = Path(r"D:\Project\TTSTextReader\CosyVoice")
 MODEL_DIR = BASE_DIR / "pretrained_models" / "Fun-CosyVoice3-0.5B"
 FLOW_PT_PATH = MODEL_DIR / "flow.pt"
 OUTPUT_DIR = BASE_DIR / "onnx_models"
@@ -188,6 +188,7 @@ def main():
             },
             do_constant_folding=True,
             verbose=False,
+            dynamo=False,
         )
     elapsed = time.time() - t0
     size_mb = OUTPUT_PATH.stat().st_size / (1024 * 1024)

@@ -24,7 +24,8 @@ import torch.nn.functional as F
 
 # ─── Paths ───────────────────────────────────────────────────────────────────
 
-BASE_DIR = Path(r"C:\Project\TTSTextReader\CosyVoice")
+BASE_DIR = Path(r"D:\Project\TTSTextReader\CosyVoice")
+sys.path.insert(0, str(BASE_DIR))
 MODEL_DIR = BASE_DIR / "pretrained_models" / "Fun-CosyVoice3-0.5B"
 FLOW_PT_PATH = MODEL_DIR / "flow.pt"
 OUTPUT_DIR = BASE_DIR / "onnx_models"
@@ -239,6 +240,7 @@ def export_onnx(estimator):
             dynamic_axes=dynamic_axes,
             do_constant_folding=True,
             verbose=False,
+            dynamo=False,
         )
 
     elapsed = time.time() - t0

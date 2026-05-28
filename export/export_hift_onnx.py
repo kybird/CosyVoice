@@ -1,4 +1,4 @@
-﻿"""
+"""
 Export CausalHiFTGenerator (CosyVoice3 HiFT vocoder) to ONNX format.
 
 Produces:
@@ -21,7 +21,8 @@ import torch.nn.functional as F
 
 # --- Paths ---
 
-BASE_DIR = Path(r"C:\Project\TTSTextReader\CosyVoice")
+BASE_DIR = Path(r"D:\Project\TTSTextReader\CosyVoice")
+sys.path.insert(0, str(BASE_DIR))
 MODEL_DIR = BASE_DIR / "pretrained_models" / "Fun-CosyVoice3-0.5B"
 HIFT_PT_PATH = MODEL_DIR / "hift.pt"
 OUTPUT_DIR = BASE_DIR / "onnx_models"
@@ -411,6 +412,7 @@ def export_model(wrapper, output_path):
             },
             do_constant_folding=True,
             verbose=False,
+            dynamo=False,
         )
 
     elapsed = time.time() - t0

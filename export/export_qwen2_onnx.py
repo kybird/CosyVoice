@@ -21,7 +21,7 @@ from transformers import Qwen2ForCausalLM, Qwen2Config, DynamicCache
 
 # ─── Paths ───────────────────────────────────────────────────────────────────
 
-BASE_DIR = Path(r"C:\Project\TTSTextReader\CosyVoice")
+BASE_DIR = Path(r"D:\Project\TTSTextReader\CosyVoice")
 MODEL_DIR = BASE_DIR / "pretrained_models" / "Fun-CosyVoice3-0.5B"
 LLM_PT_PATH = MODEL_DIR / "llm.pt"
 OUTPUT_DIR = BASE_DIR / "onnx_models"
@@ -129,8 +129,10 @@ def export_initial_model(model, output_path):
 
     hidden = outputs.last_hidden_state
     pkv = outputs.past_key_values
+    # Handle both legacy list and new DynamicCache object
+    pkv_list = list(pkv.to_legacy_cache() if hasattr(pkv, 'to_legacy_cache') else pkv)
     print(f"  hidden_state shape: {hidden.shape}")
-    print(f"  KV cache layers: {len(pkv)}, key shape: {pkv[0][0].shape}")
+    print(f"  KV cache layers: {len(pkv_list)}, key shape: {pkv_list[0][0].shape}")
 
     # Build wrapper for clean ONNX I/O
     class InitialModelWrapper(torch.nn.Module):
@@ -147,7 +149,9 @@ def export_initial_model(model, output_path):
             )
             # Return hidden state + flat KV cache
             out = [outputs.last_hidden_state]
-            for layer_kv in outputs.past_key_values:
+            pkv_out = outputs.past_key_values
+            pkv_legacy = list(pkv_out.to_legacy_cache() if hasattr(pkv_out, 'to_legacy_cache') else pkv_out)
+            for layer_kv in pkv_legacy:
                 out.append(layer_kv[0])  # key
                 out.append(layer_kv[1])  # value
             return tuple(out)
@@ -207,11 +211,12 @@ def export_decode_model(model, output_path):
     inputs_embeds = torch.randn(BATCH_SIZE, 1, HIDDEN_SIZE)
     position_ids = torch.tensor([[past_len]], dtype=torch.long)
 
-    # Build DynamicCache for dry run
+    # Build DynamicCache for dry run (transformers 5.x compatible)
     cache = DynamicCache()
     for i in range(NUM_LAYERS):
-        cache.key_cache.append(torch.randn(BATCH_SIZE, NUM_KV_HEADS, past_len, HEAD_DIM))
-        cache.value_cache.append(torch.randn(BATCH_SIZE, NUM_KV_HEADS, past_len, HEAD_DIM))
+        key = torch.randn(BATCH_SIZE, NUM_KV_HEADS, past_len, HEAD_DIM)
+        val = torch.randn(BATCH_SIZE, NUM_KV_HEADS, past_len, HEAD_DIM)
+        cache.update(key, val, layer_idx=i)
 
     # Dry run
     attention_mask = torch.ones(BATCH_SIZE, past_len + 1, dtype=torch.long)
@@ -227,8 +232,10 @@ def export_decode_model(model, output_path):
 
     hidden = outputs.last_hidden_state
     pkv = outputs.past_key_values
+    # Convert to legacy format for consistent access
+    pkv_legacy = list(pkv.to_legacy_cache() if hasattr(pkv, 'to_legacy_cache') else pkv)
     print(f"  hidden_state shape: {hidden.shape}")
-    print(f"  Updated KV key shape: {pkv.key_cache[0].shape}, type: {type(pkv)}")
+    print(f"  Updated KV key shape: {pkv_legacy[0][0].shape}, type: {type(pkv)}")
 
     class DecodeModelWrapper(torch.nn.Module):
         """Wrapper that manually iterates layers, avoiding DynamicCache mutation issues during tracing."""
@@ -335,10 +342,11 @@ def export_decode_model(model, output_path):
     wrapper.eval()
 
     # Build inputs list from cache tensors
+    cache_legacy = list(cache.to_legacy_cache() if hasattr(cache, 'to_legacy_cache') else cache)
     flat_past_inputs = []
     for i in range(NUM_LAYERS):
-        flat_past_inputs.append(cache.key_cache[i])
-        flat_past_inputs.append(cache.value_cache[i])
+        flat_past_inputs.append(cache_legacy[i][0])  # key
+        flat_past_inputs.append(cache_legacy[i][1])  # value
 
     # Dynamic axes
     dynamic_axes = {
@@ -376,6 +384,7 @@ def export_decode_model(model, output_path):
             dynamic_axes=dynamic_axes,
             do_constant_folding=True,
             verbose=False,
+            dynamo=False,
         )
 
     elapsed = time.time() - t0
@@ -407,10 +416,11 @@ def verify_models(model):
         )
 
     pt_hidden = pt_out.last_hidden_state.numpy()
-    # past_key_values is a DynamicCache: .key_cache[i], .value_cache[i]
+    # past_key_values is a DynamicCache
     pt_cache = pt_out.past_key_values
-    pt_kv_keys = [pt_cache.key_cache[i].numpy() for i in range(NUM_LAYERS)]
-    pt_kv_vals = [pt_cache.value_cache[i].numpy() for i in range(NUM_LAYERS)]
+    pt_cache_legacy = list(pt_cache.to_legacy_cache() if hasattr(pt_cache, 'to_legacy_cache') else pt_cache)
+    pt_kv_keys = [kv[0].numpy() for kv in pt_cache_legacy]
+    pt_kv_vals = [kv[1].numpy() for kv in pt_cache_legacy]
 
     sess_init = ort.InferenceSession(str(initial_path), providers=["CPUExecutionProvider"])
     ort_out = sess_init.run(None, {
@@ -449,8 +459,7 @@ def verify_models(model):
     # Reconstruct DynamicCache from initial run outputs
     past_cache = DynamicCache()
     for i in range(NUM_LAYERS):
-        past_cache.key_cache.append(pt_cache.key_cache[i].clone())
-        past_cache.value_cache.append(pt_cache.value_cache[i].clone())
+        past_cache.update(pt_cache_legacy[i][0].clone(), pt_cache_legacy[i][1].clone(), layer_idx=i)
 
     with torch.no_grad():
         pt_dec_out = model.model(
@@ -463,8 +472,9 @@ def verify_models(model):
 
     pt_dec_hidden = pt_dec_out.last_hidden_state.numpy()
     dec_cache = pt_dec_out.past_key_values
-    pt_dec_keys = [dec_cache.key_cache[i].numpy() for i in range(NUM_LAYERS)]
-    pt_dec_vals = [dec_cache.value_cache[i].numpy() for i in range(NUM_LAYERS)]
+    dec_cache_legacy = list(dec_cache.to_legacy_cache() if hasattr(dec_cache, 'to_legacy_cache') else dec_cache)
+    pt_dec_keys = [kv[0].numpy() for kv in dec_cache_legacy]
+    pt_dec_vals = [kv[1].numpy() for kv in dec_cache_legacy]
 
     # Build ONNX inputs
     dec_feed = {
@@ -472,8 +482,8 @@ def verify_models(model):
         "position_ids": dec_position_ids.numpy(),
     }
     for i in range(NUM_LAYERS):
-        dec_feed[f"past_key_{i}_in"] = pt_cache.key_cache[i].numpy()
-        dec_feed[f"past_value_{i}_in"] = pt_cache.value_cache[i].numpy()
+        dec_feed[f"past_key_{i}_in"] = pt_cache_legacy[i][0].numpy()
+        dec_feed[f"past_value_{i}_in"] = pt_cache_legacy[i][1].numpy()
 
     sess_dec = ort.InferenceSession(str(decode_path), providers=["CPUExecutionProvider"])
     ort_dec_out = sess_dec.run(None, dec_feed)
