@@ -31,8 +31,8 @@ from pathlib import Path
 # Paths
 # ──────────────────────────────────────────────────────────────────────────────
 
-BASE_DIR = Path(r"D:\Project\TTSTextReader\CosyVoice")
-OUTPUT_DIR = BASE_DIR / "onnx_models"
+import sys; sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from paths import BASE_DIR, ONNX_DIR as OUTPUT_DIR
 OPSET = 17
 
 

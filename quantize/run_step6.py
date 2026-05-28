@@ -2,8 +2,11 @@
 import os
 import sys
 import time
+from pathlib import Path
 
-ONNX_DIR = r"D:\Project\TTSTextReader\CosyVoice\onnx_models"
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from paths import ONNX_DIR as _ONNX_DIR, QUANTIZE_DIR as _QUANTIZE_DIR, BASE_DIR as _BASE_DIR
+ONNX_DIR = str(_ONNX_DIR)
 
 t0 = time.time()
 
@@ -41,8 +44,8 @@ print("\n" + "=" * 60)
 print("Step 6b: DiT FFN-only INT8")
 print("=" * 60)
 
-sys.path.insert(0, r"D:\Project\TTSTextReader\CosyVoice")
-quantize_script = os.path.join(r"D:\Project\TTSTextReader\CosyVoice\quantize", "quantize_dit_ffn_int8.py")
+sys.path.insert(0, str(_BASE_DIR))
+quantize_script = os.path.join(str(_QUANTIZE_DIR), "quantize_dit_ffn_int8.py")
 if os.path.exists(quantize_script):
     print(f"  Running {quantize_script}...")
     exec(open(quantize_script).read())

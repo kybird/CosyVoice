@@ -21,10 +21,10 @@ from transformers import Qwen2ForCausalLM, Qwen2Config, DynamicCache
 
 # ─── Paths ───────────────────────────────────────────────────────────────────
 
-BASE_DIR = Path(r"D:\Project\TTSTextReader\CosyVoice")
-MODEL_DIR = BASE_DIR / "pretrained_models" / "Fun-CosyVoice3-0.5B"
+import sys; sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from paths import BASE_DIR, MODEL_DIR, ONNX_DIR as OUTPUT_DIR
+
 LLM_PT_PATH = MODEL_DIR / "llm.pt"
-OUTPUT_DIR = BASE_DIR / "onnx_models"
 
 # ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -384,7 +384,6 @@ def export_decode_model(model, output_path):
             dynamic_axes=dynamic_axes,
             do_constant_folding=True,
             verbose=False,
-            dynamo=False,
         )
 
     elapsed = time.time() - t0

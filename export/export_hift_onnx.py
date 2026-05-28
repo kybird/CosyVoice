@@ -21,11 +21,11 @@ import torch.nn.functional as F
 
 # --- Paths ---
 
-BASE_DIR = Path(r"D:\Project\TTSTextReader\CosyVoice")
+import sys; sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from paths import BASE_DIR, MODEL_DIR, ONNX_DIR as OUTPUT_DIR
+
 sys.path.insert(0, str(BASE_DIR))
-MODEL_DIR = BASE_DIR / "pretrained_models" / "Fun-CosyVoice3-0.5B"
 HIFT_PT_PATH = MODEL_DIR / "hift.pt"
-OUTPUT_DIR = BASE_DIR / "onnx_models"
 OUTPUT_PATH = OUTPUT_DIR / "hift.onnx"
 
 # --- Config (from cosyvoice3.yaml) ---
@@ -399,21 +399,18 @@ def export_model(wrapper, output_path):
     t0 = time.time()
 
     with torch.no_grad():
-        torch.onnx.export(
-            wrapper,
-            (speech_feat,),
-            str(output_path),
-            opset_version=OPSET,
-            input_names=["speech_feat"],
-            output_names=["generated_speech"],
-            dynamic_axes={
-                "speech_feat": {2: "T_mel"},
-                "generated_speech": {1: "T_audio"},
-            },
-            do_constant_folding=True,
-            verbose=False,
-            dynamo=False,
-        )
+        torch.onnx.export(wrapper,
+        (speech_feat,),
+        str(output_path),
+        opset_version=OPSET,
+        input_names=["speech_feat"],
+        output_names=["generated_speech"],
+        dynamic_axes={
+            "speech_feat": {2: "T_mel"},
+            "generated_speech": {1: "T_audio"},
+        },
+        do_constant_folding=True,
+        verbose=False, )
 
     elapsed = time.time() - t0
     size_mb = output_path.stat().st_size / (1024 * 1024)

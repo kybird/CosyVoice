@@ -19,7 +19,13 @@ REM ============================================================
 
 setlocal enabledelayedexpansion
 
-set PYTHON=C:\Users\admin\miniconda3\envs\melotts\python.exe
+REM Python: use conda-activated python, or override via PYTHON_PATH env var
+if defined PYTHON_PATH (
+    set PYTHON=%PYTHON_PATH%
+) else (
+    call conda activate melotts 2>nul
+    set PYTHON=python
+)
 set ROOT_DIR=%~dp0
 set ONNX_DIR=%ROOT_DIR%onnx_models
 set EXPORT_DIR=%ROOT_DIR%export

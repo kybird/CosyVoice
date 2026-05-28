@@ -26,10 +26,10 @@ import torch.nn.functional as F
 
 # ─── Paths ───────────────────────────────────────────────────────────────────
 
-BASE_DIR = Path(r"D:\Project\TTSTextReader\CosyVoice")
-MODEL_DIR = BASE_DIR / "pretrained_models" / "Fun-CosyVoice3-0.5B"
+import sys; sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from paths import BASE_DIR, MODEL_DIR, ONNX_DIR as OUTPUT_DIR
+
 FLOW_PT_PATH = MODEL_DIR / "flow.pt"
-OUTPUT_DIR = BASE_DIR / "onnx_models"
 OUTPUT_PATH = OUTPUT_DIR / "flow_prep.onnx"
 
 # ─── Config ──────────────────────────────────────────────────────────────────
@@ -173,23 +173,20 @@ def main():
     print(f"\nExporting to {OUTPUT_PATH} ...")
     t0 = time.time()
     with torch.no_grad():
-        torch.onnx.export(
-            model,
-            (token_ids, speaker_emb, prompt_feat),
-            str(OUTPUT_PATH),
-            opset_version=OPSET,
-            input_names=["token_ids", "speaker_emb", "prompt_feat"],
-            output_names=["mu", "spks", "cond"],
-            dynamic_axes={
-                "token_ids": {1: "T"},
-                "prompt_feat": {1: "T_prompt"},
-                "mu": {2: "T_mel"},
-                "cond": {2: "T_mel"},
-            },
-            do_constant_folding=True,
-            verbose=False,
-            dynamo=False,
-        )
+        torch.onnx.export(model,
+        (token_ids, speaker_emb, prompt_feat),
+        str(OUTPUT_PATH),
+        opset_version=OPSET,
+        input_names=["token_ids", "speaker_emb", "prompt_feat"],
+        output_names=["mu", "spks", "cond"],
+        dynamic_axes={
+            "token_ids": {1: "T"},
+            "prompt_feat": {1: "T_prompt"},
+            "mu": {2: "T_mel"},
+            "cond": {2: "T_mel"},
+        },
+        do_constant_folding=True,
+        verbose=False, )
     elapsed = time.time() - t0
     size_mb = OUTPUT_PATH.stat().st_size / (1024 * 1024)
     print(f"  Done in {elapsed:.1f}s, size: {size_mb:.1f} MB")

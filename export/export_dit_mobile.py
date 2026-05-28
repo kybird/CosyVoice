@@ -24,11 +24,11 @@ import torch.nn.functional as F
 
 # ─── Paths ───────────────────────────────────────────────────────────────────
 
-BASE_DIR = Path(r"D:\Project\TTSTextReader\CosyVoice")
+import sys; sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from paths import BASE_DIR, MODEL_DIR, ONNX_DIR as OUTPUT_DIR
+
 sys.path.insert(0, str(BASE_DIR))
-MODEL_DIR = BASE_DIR / "pretrained_models" / "Fun-CosyVoice3-0.5B"
 FLOW_PT_PATH = MODEL_DIR / "flow.pt"
-OUTPUT_DIR = BASE_DIR / "onnx_models"
 ONNX_OUTPUT_PATH = OUTPUT_DIR / "dit_estimator_mobile.onnx"
 
 # ─── Config ──────────────────────────────────────────────────────────────────
@@ -230,18 +230,15 @@ def export_onnx(estimator):
     t0 = time.time()
 
     with torch.no_grad():
-        torch.onnx.export(
-            wrapper,
-            (x, mask, mu, t, spks, cond),
-            str(ONNX_OUTPUT_PATH),
-            opset_version=OPSET,
-            input_names=input_names,
-            output_names=output_names,
-            dynamic_axes=dynamic_axes,
-            do_constant_folding=True,
-            verbose=False,
-            dynamo=False,
-        )
+        torch.onnx.export(wrapper,
+        (x, mask, mu, t, spks, cond),
+        str(ONNX_OUTPUT_PATH),
+        opset_version=OPSET,
+        input_names=input_names,
+        output_names=output_names,
+        dynamic_axes=dynamic_axes,
+        do_constant_folding=True,
+        verbose=False, )
 
     elapsed = time.time() - t0
     size_mb = ONNX_OUTPUT_PATH.stat().st_size / (1024 * 1024)

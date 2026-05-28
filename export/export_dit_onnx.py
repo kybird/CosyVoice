@@ -19,10 +19,10 @@ import torch
 
 # ─── Paths ───────────────────────────────────────────────────────────────────
 
-BASE_DIR = Path(r"C:\Project\TTSTextReader\CosyVoice")
-MODEL_DIR = BASE_DIR / "pretrained_models" / "Fun-CosyVoice3-0.5B"
+import sys; sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from paths import BASE_DIR, MODEL_DIR, ONNX_DIR as OUTPUT_DIR
+
 FLOW_PT_PATH = MODEL_DIR / "flow.pt"
-OUTPUT_DIR = BASE_DIR / "onnx_models"
 ONNX_OUTPUT_PATH = OUTPUT_DIR / "dit_estimator.onnx"
 
 # ─── Config ──────────────────────────────────────────────────────────────────
