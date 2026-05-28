@@ -3,12 +3,12 @@ CosyVoice3 ONNX Pipeline Integration Test
 
 Runs the COMPLETE CosyVoice3 TTS pipeline using ONNX Runtime for all
 heavy computation (LLM transformer, DiT estimator, HiFT vocoder).
-PyTorch is used only for preprocessing (feature extraction, torchaudio).
+PyTorch/torchaudio are NOT imported — all feature extraction via ONNX Runtime.
 LLM embedding/decoder uses llm_embed.onnx — no torch dependency in LLM.
 
 Pipeline:
-  1. Preprocessing (PyTorch/torchaudio):
-     - Load reference WAV, extract mel features
+  1. Preprocessing (ONNX mel + soundfile/scipy):
+     - Load reference WAV (soundfile), resample (scipy), extract mel features (ONNX)
      - Extract speech tokens via speech_tokenizer_v3.onnx
      - Extract speaker embedding via campplus.onnx
      - Tokenize input text via Qwen2 tokenizer
@@ -26,8 +26,8 @@ Pipeline:
   4. HiFT vocoder (ONNX):
      - hift.onnx: mel spectrogram -> audio waveform
 
-  5. Postprocessing (torchaudio):
-     - Save as WAV
+  5. Postprocessing (soundfile):
+      - Save as WAV
 
 Usage:
     python test_onnx_pipeline.py
@@ -42,14 +42,12 @@ import argparse
 import logging
 from pathlib import Path
 
-# Add Matcha-TTS to path (required for mel_spectrogram)
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "third_party" / "Matcha-TTS"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
-import torch
-import torchaudio
 import onnxruntime as ort
+import soundfile as sf
+from scipy.signal import resample_poly
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("onnx_pipeline")
@@ -58,11 +56,11 @@ log = logging.getLogger("onnx_pipeline")
 # Configuration
 # ──────────────────────────────────────────────────────────────────────────────
 
-BASE_DIR = Path(r"C:\Project\TTSTextReader\CosyVoice")
+BASE_DIR = Path(r"D:\Project\TTSTextReader\CosyVoice")
 MODEL_DIR = BASE_DIR / "pretrained_models" / "Fun-CosyVoice3-0.5B"
 ONNX_DIR = BASE_DIR / "onnx_models"
 OUTPUT_DIR = BASE_DIR / "outputs"
-TTSTEXTVIEWER_DIR = Path(r"C:\Project\TTSTextReader\TTSTextViewer")
+TTSTEXTVIEWER_DIR = Path(r"D:\Project\TTSTextReader\TTSTextViewer")
 
 # Model constants (from cosyvoice3.yaml)
 HIDDEN_SIZE = 896
@@ -91,7 +89,7 @@ SAMPLING_TOP_K = 10  # Reduced from 25 for more stability
 REPETITION_PENALTY = 1.2  # Penalty for recently repeated tokens
 
 # Default I/O
-DEFAULT_REF_WAV = str(TTSTEXTVIEWER_DIR / "openvoice" / "ref_03s.wav")
+DEFAULT_REF_WAV = str(TTSTEXTVIEWER_DIR / "openvoice_test" / "ref_03s.wav")
 DEFAULT_TTS_TEXT = "안녕하세요, 반갑습니다."
 DEFAULT_OUTPUT = str(OUTPUT_DIR / "onnx_test_output.wav")
 
@@ -113,31 +111,27 @@ SILENT_TOKENS = {1, 2, 28, 29, 55, 248, 494, 2241, 2242, 2322, 2323}
 # ──────────────────────────────────────────────────────────────────────────────
 
 def load_wav(path, target_sr, trim_silence=True, silence_threshold=0.01, silence_padding_ms=50):
-    """Load and resample WAV to target sample rate, mono.
-    
-    Args:
-        trim_silence: If True, trim leading/trailing silence.
-        silence_threshold: Amplitude threshold for silence detection.
-        silence_padding_ms: Padding to keep after trimming (ms).
-    """
-    speech, sr = torchaudio.load(path, backend="soundfile")
-    speech = speech.mean(dim=0, keepdim=True)
+    """Load and resample WAV to target sample rate, mono. Uses soundfile + scipy."""
+    speech, sr = sf.read(path, dtype='float32')
+    # Convert to mono if stereo
+    if speech.ndim > 1:
+        speech = speech.mean(axis=1)
+    # Resample if needed
     if sr != target_sr:
-        speech = torchaudio.transforms.Resample(orig_freq=sr, new_freq=target_sr)(speech)
-    
+        gcd = np.gcd(sr, target_sr)
+        speech = resample_poly(speech, target_sr // gcd, sr // gcd)
+    # Trim silence
     if trim_silence:
-        energy = speech.abs().squeeze(0)
-        above = (energy > silence_threshold).nonzero()
+        energy = np.abs(speech)
+        above = np.where(energy > silence_threshold)[0]
         if len(above) > 0:
-            first = above[0].item()
-            last = above[-1].item()
-            # Keep a small padding around the voice
+            first = above[0]
+            last = above[-1]
             pad_samples = int(silence_padding_ms * target_sr / 1000)
             first = max(0, first - pad_samples)
-            last = min(speech.shape[1] - 1, last + pad_samples)
-            speech = speech[:, first:last + 1]
-    
-    return speech
+            last = min(len(speech) - 1, last + pad_samples)
+            speech = speech[first:last + 1]
+    return speech  # returns numpy 1D float32 array
 
 
 def create_onnx_session(path, provider="CUDAExecutionProvider", log_level=3,
@@ -210,21 +204,33 @@ class Preprocessor:
             cp_path, sess_options=opts2, providers=["CPUExecutionProvider"]
         )
 
-        # --- Mel feature extractor ---
-        import whisper
-        self.whisper_log_mel = whisper.log_mel_spectrogram
-        import torchaudio.compliance.kaldi as kaldi
-        self.kaldi_fbank = kaldi.fbank
+        # --- ONNX Mel extractors ---
+        log.info("[Preproc] Loading mel_16k_128bin.onnx (whisper mel for speech tokenizer) ...")
+        mel_16k_path = str(self.onnx_dir / "mel_16k_128bin.onnx")
+        opts_mel = ort.SessionOptions()
+        opts_mel.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        opts_mel.intra_op_num_threads = 1
+        self.mel_16k_session = ort.InferenceSession(mel_16k_path, sess_options=opts_mel, providers=["CPUExecutionProvider"])
+
+        log.info("[Preproc] Loading mel_24k_80bin.onnx (matcha mel for flow prompt) ...")
+        mel_24k_path = str(self.onnx_dir / "mel_24k_80bin.onnx")
+        self.mel_24k_session = ort.InferenceSession(mel_24k_path, sess_options=opts_mel, providers=["CPUExecutionProvider"])
+
+        # --- Kaldi fbank ONNX (speaker embedding for campplus) ---
+        log.info("[Preproc] Loading fbank_16k_80bin.onnx (kaldi fbank for campplus) ...")
+        fbank_path = str(self.onnx_dir / "fbank_16k_80bin.onnx")
+        self.fbank_session = ort.InferenceSession(fbank_path, sess_options=opts_mel, providers=["CPUExecutionProvider"])
 
     def extract_speech_tokens(self, wav_path):
         """Extract speech tokens from reference audio via speech_tokenizer_v3.onnx."""
         t0 = time.time()
-        speech = load_wav(wav_path, 16000)
-        import whisper
-        feat = whisper.log_mel_spectrogram(speech, n_mels=128)
+        speech = load_wav(wav_path, 16000)  # returns numpy 1D
+        # ONNX mel extraction (whisper 128-bin)
+        speech_input = speech.reshape(1, -1).astype(np.float32)
+        mel_feat = self.mel_16k_session.run(None, {"waveform": speech_input})[0]  # (1, 128, T)
         inp = {
-            self.speech_tokenizer_session.get_inputs()[0].name: feat.detach().cpu().numpy(),
-            self.speech_tokenizer_session.get_inputs()[1].name: np.array([feat.shape[2]], dtype=np.int32),
+            self.speech_tokenizer_session.get_inputs()[0].name: mel_feat,
+            self.speech_tokenizer_session.get_inputs()[1].name: np.array([mel_feat.shape[2]], dtype=np.int32),
         }
         tokens = self.speech_tokenizer_session.run(None, inp)[0].flatten().tolist()
         elapsed = time.time() - t0
@@ -234,36 +240,28 @@ class Preprocessor:
     def extract_speaker_embedding(self, wav_path):
         """Extract speaker embedding from reference audio via campplus.onnx."""
         t0 = time.time()
-        import torchaudio.compliance.kaldi as kaldi
-        speech = load_wav(wav_path, 16000)
-        feat = kaldi.fbank(speech, num_mel_bins=80, dither=0, sample_frequency=16000)
-        feat = feat - feat.mean(dim=0, keepdim=True)
-        inp = {self.campplus_session.get_inputs()[0].name: feat.unsqueeze(dim=0).cpu().numpy()}
+        speech = load_wav(wav_path, 16000)  # returns numpy 1D
+        # ONNX kaldi fbank extraction
+        speech_input = speech.reshape(1, -1).astype(np.float32)
+        feat = self.fbank_session.run(None, {"waveform": speech_input})[0]  # (T_frames, 80)
+        # Mean subtraction (part of campplus preprocessing)
+        feat = feat - feat.mean(axis=0, keepdims=True)
+        inp = {self.campplus_session.get_inputs()[0].name: feat[np.newaxis].astype(np.float32)}
         embedding = self.campplus_session.run(None, inp)[0].flatten()
         elapsed = time.time() - t0
         log.info(f"[Preproc] Speaker embedding: shape={embedding.shape} in {elapsed:.2f}s")
-        return torch.tensor(embedding, dtype=torch.float32)
+        return embedding  # returns numpy array
 
     def extract_prompt_speech_feat(self, wav_path):
         """Extract mel spectrogram features for the flow model prompt."""
         t0 = time.time()
-        from matcha.utils.audio import mel_spectrogram
-        speech = load_wav(wav_path, SAMPLE_RATE)
-        feat = mel_spectrogram(
-            speech,
-            n_fft=1920,
-            num_mels=80,
-            sampling_rate=SAMPLE_RATE,
-            hop_size=480,
-            win_size=1920,
-            fmin=0,
-            fmax=None,
-            center=False,
-        )
-        feat = feat.squeeze(dim=0).transpose(0, 1).unsqueeze(dim=0)  # (1, T, 80)
+        speech = load_wav(wav_path, SAMPLE_RATE)  # returns numpy 1D
+        # ONNX mel extraction (matcha 80-bin)
+        speech_input = speech.reshape(1, -1).astype(np.float32)
+        feat = self.mel_24k_session.run(None, {"waveform": speech_input})[0]  # (1, T, 80)
         elapsed = time.time() - t0
         log.info(f"[Preproc] Prompt speech feat: shape={feat.shape} in {elapsed:.2f}s")
-        return feat
+        return feat  # returns numpy (1, T, 80)
 
     def tokenize_text(self, text):
         """Tokenize text using the CosyVoice3 Qwen2 tokenizer."""
@@ -278,7 +276,7 @@ class Preprocessor:
           - tts_text_tokens: list[int]
           - speech_tokens: list[int]  (from ref audio)
           - speaker_embedding: np.ndarray (192,)
-          - prompt_speech_feat: torch.Tensor (1, T, 80)
+          - prompt_speech_feat: np.ndarray (1, T, 80)
         """
         # Align speech_feat and speech_token lengths (token_mel_ratio=2)
         prompt_speech_feat = self.extract_prompt_speech_feat(ref_wav)
@@ -318,7 +316,7 @@ class LLMOnnxInference:
         # Load llm_embed.onnx (embed_tokens + speech_embedding + llm_decoder)
         log.info("[LLM] Loading llm_embed.onnx ...")
         provider = "CUDAExecutionProvider" if "CUDAExecutionProvider" in ort.get_available_providers() else "CPUExecutionProvider"
-        self.embed_session = create_onnx_session(str(self.onnx_dir / "llm_embed.onnx"), provider)
+        self.embed_session = create_onnx_session(str(self.onnx_dir / "llm_embed.onnx"), provider, intra_threads=4)
 
         # ONNX sessions for transformer
         if use_int8:
@@ -329,8 +327,8 @@ class LLMOnnxInference:
             decode_path = str(self.onnx_dir / "llm_decode.onnx")
 
         log.info("[LLM] Loading ONNX sessions ...")
-        self.initial_session = create_onnx_session(initial_path, provider)
-        self.decode_session = create_onnx_session(decode_path, provider)
+        self.initial_session = create_onnx_session(initial_path, provider, intra_threads=4)
+        self.decode_session = create_onnx_session(decode_path, provider, intra_threads=4)
 
         # Dummy inputs for llm_embed.onnx (unused outputs are computed but discarded)
         self._dummy_token_ids = np.array([0], dtype=np.int64)
@@ -588,7 +586,7 @@ class FlowOnnxInference:
         flow_prep_path = str(self.onnx_dir / "flow_prep_mobile.onnx")
         if not os.path.exists(flow_prep_path):
             flow_prep_path = str(self.onnx_dir / "flow_prep.onnx")
-        self.flow_prep_session = create_onnx_session(flow_prep_path, provider)
+        self.flow_prep_session = create_onnx_session(flow_prep_path, provider, intra_threads=16)
 
         # Load DiT estimator ONNX (tuned threads for heavy transformer)
         # Priority: FFN INT8 > mobile FP32 > original
@@ -599,7 +597,7 @@ class FlowOnnxInference:
             if not os.path.exists(dit_path):
                 dit_path = str(self.onnx_dir / "dit_estimator.onnx")
         # DiT is the main bottleneck — use all available CPU cores
-        self.dit_session = create_onnx_session(dit_path, provider, intra_threads=0)
+        self.dit_session = create_onnx_session(dit_path, provider, intra_threads=16)
 
     def run(self, speech_tokens, prompt_tokens, prompt_speech_feat, speaker_embedding):
         """Run flow matching inference.
@@ -607,8 +605,8 @@ class FlowOnnxInference:
         Args:
             speech_tokens: list[int] - generated speech tokens from LLM
             prompt_tokens: list[int] - speech tokens from reference audio
-            prompt_speech_feat: torch.Tensor (1, T_prompt, 80) — will be converted to numpy
-            speaker_embedding: torch.Tensor (192,) — will be converted to numpy
+            prompt_speech_feat: np.ndarray (1, T_prompt, 80)
+            speaker_embedding: np.ndarray (192,)
 
         Returns:
             mel_spectrogram: np.ndarray (1, 80, T_mel)
@@ -620,8 +618,8 @@ class FlowOnnxInference:
         token_ids = np.array([all_tokens], dtype=np.int64)
         token_ids = np.clip(token_ids, 0, SPEECH_TOKEN_SIZE - 1)
 
-        spk_emb = speaker_embedding.numpy().astype(np.float32).reshape(1, -1)  # (1, 192)
-        prompt_feat = prompt_speech_feat.numpy().astype(np.float32)  # (1, T_prompt, 80)
+        spk_emb = speaker_embedding.astype(np.float32).reshape(1, -1)  # (1, 192)
+        prompt_feat = prompt_speech_feat.astype(np.float32)  # (1, T_prompt, 80)
 
         # ── Run flow_prep.onnx ──
         prep_out = self.flow_prep_session.run(None, {
@@ -717,7 +715,7 @@ class HiFTOnnxInference:
     def __init__(self, onnx_dir):
         log.info("[HiFT] Loading HiFT ONNX ...")
         provider = "CUDAExecutionProvider" if "CUDAExecutionProvider" in ort.get_available_providers() else "CPUExecutionProvider"
-        self.session = create_onnx_session(str(Path(onnx_dir) / "hift.onnx"), provider)
+        self.session = create_onnx_session(str(Path(onnx_dir) / "hift.onnx"), provider, intra_threads=16)
 
     def run(self, mel_spectrogram):
         """Convert mel spectrogram to audio.
@@ -891,14 +889,11 @@ def main():
     print("Stage 5: Saving Output")
     print("=" * 70)
 
-    audio_tensor = torch.tensor(audio, dtype=torch.float32)
-    if audio_tensor.dim() == 2:
-        pass  # (1, T)
-    elif audio_tensor.dim() == 1:
-        audio_tensor = audio_tensor.unsqueeze(0)
-    torchaudio.save(args.output, audio_tensor, SAMPLE_RATE)
+    # Ensure mono 1D
+    audio_out = audio.flatten().astype(np.float32)
+    sf.write(args.output, audio_out, SAMPLE_RATE)
 
-    audio_duration = audio_tensor.shape[1] / SAMPLE_RATE
+    audio_duration = len(audio_out) / SAMPLE_RATE
     total_time = sum(timings.values())
 
     print(f"\n{'=' * 70}")
