@@ -16,6 +16,8 @@ Pipeline:
   2. LLM inference (ONNX):
      - llm_embed.onnx: embedding lookup + linear decoder (no PyTorch)
      - llm_initial.onnx: prefill (full prompt) -> hidden states + KV cache
+  - llm_initial_int8.onnx: INT8 quantized version (lower quality, 344MB)
+  - FP32 initial is default for best pronunciation quality
      - llm_decode.onnx: autoregressive decode loop (1 token at a time)
      - Sampling: pure numpy (softmax, top-k, multinomial)
 
@@ -31,7 +33,9 @@ Pipeline:
 
 Usage:
     python test_onnx_pipeline.py
-    python test_onnx_pipeline.py --use_int8
+    python test_onnx_pipeline.py                    # FP32 initial + INT8 decode (default, best tradeoff)
+python test_onnx_pipeline.py --use_int8         # INT8 both (lower quality)
+python test_onnx_pipeline.py --use_fp32         # FP32 both (highest quality)
     python test_onnx_pipeline.py --ref_wav path/to/ref.wav --tts_text "text"
 """
 
@@ -56,11 +60,9 @@ log = logging.getLogger("onnx_pipeline")
 # Configuration
 # ──────────────────────────────────────────────────────────────────────────────
 
-BASE_DIR = Path(r"D:\Project\TTSTextReader\CosyVoice")
-MODEL_DIR = BASE_DIR / "pretrained_models" / "Fun-CosyVoice3-0.5B"
-ONNX_DIR = BASE_DIR / "onnx_models"
-OUTPUT_DIR = BASE_DIR / "outputs"
-TTSTEXTVIEWER_DIR = Path(r"D:\Project\TTSTextReader\TTSTextViewer")
+BASE_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(BASE_DIR))
+from paths import MODEL_DIR, ONNX_DIR, OUTPUT_DIR, TTSTEXTVIEWER_DIR, REF_WAV_SUBDIR
 
 # Model constants (from cosyvoice3.yaml)
 HIDDEN_SIZE = 896
@@ -89,7 +91,7 @@ SAMPLING_TOP_K = 10  # Reduced from 25 for more stability
 REPETITION_PENALTY = 1.2  # Penalty for recently repeated tokens
 
 # Default I/O
-DEFAULT_REF_WAV = str(TTSTEXTVIEWER_DIR / "openvoice_test" / "ref_03s.wav")
+DEFAULT_REF_WAV = str(TTSTEXTVIEWER_DIR / REF_WAV_SUBDIR / "ref_03s.wav")
 DEFAULT_TTS_TEXT = "안녕하세요, 반갑습니다."
 DEFAULT_OUTPUT = str(OUTPUT_DIR / "onnx_test_output.wav")
 
@@ -176,11 +178,11 @@ class Preprocessor:
         self.model_dir = Path(model_dir)
         self.onnx_dir = Path(onnx_dir)
 
-        # --- Tokenizer (Qwen2-based) ---
-        log.info("[Preproc] Loading Qwen2 tokenizer ...")
-        from cosyvoice.tokenizer.tokenizer import CosyVoice3Tokenizer
+        # --- Tokenizer (Qwen2-based, lightweight — no torch/transformers) ---
+        log.info("[Preproc] Loading Qwen2 tokenizer (tokenizers library) ...")
+        from cosyvoice.tokenizer.tokenizer_lite import CosyVoice3TokenizerLite
         token_path = str(self.model_dir / "CosyVoice-BlankEN")
-        self.tokenizer = CosyVoice3Tokenizer(token_path=token_path, skip_special_tokens=True)
+        self.tokenizer = CosyVoice3TokenizerLite(token_path=token_path, skip_special_tokens=True)
 
         # --- Speech tokenizer ONNX (speech_tokenizer_v3.onnx) ---
         log.info("[Preproc] Loading speech tokenizer ONNX ...")
@@ -309,26 +311,33 @@ class LLMOnnxInference:
     NO PyTorch dependency — all embedding/decoder/sampling via llm_embed.onnx + numpy.
     """
 
-    def __init__(self, model_dir, onnx_dir, use_int8=False):
+    def __init__(self, model_dir, onnx_dir, use_int8=False, use_fp32=False):
         self.model_dir = Path(model_dir)
         self.onnx_dir = Path(onnx_dir)
 
         # Load llm_embed.onnx (embed_tokens + speech_embedding + llm_decoder)
         log.info("[LLM] Loading llm_embed.onnx ...")
         provider = "CUDAExecutionProvider" if "CUDAExecutionProvider" in ort.get_available_providers() else "CPUExecutionProvider"
-        self.embed_session = create_onnx_session(str(self.onnx_dir / "llm_embed.onnx"), provider, intra_threads=4)
+        self.embed_session = create_onnx_session(str(self.onnx_dir / "llm_embed.onnx"), provider)
 
         # ONNX sessions for transformer
+        # Production config: FP32 initial (quality) + INT8 decode (speed)
+        # --use_int8 forces INT8 for both (lower quality, smaller memory)
+        # --use_fp32 forces FP32 for both (highest quality, larger memory)
         if use_int8:
             initial_path = str(self.onnx_dir / "llm_initial_int8.onnx")
             decode_path = str(self.onnx_dir / "llm_decode_int8.onnx")
-        else:
+        elif use_fp32:
             initial_path = str(self.onnx_dir / "llm_initial.onnx")
             decode_path = str(self.onnx_dir / "llm_decode.onnx")
+        else:
+            # Default: FP32 initial + INT8 decode (best quality/speed tradeoff)
+            initial_path = str(self.onnx_dir / "llm_initial.onnx")
+            decode_path = str(self.onnx_dir / "llm_decode_int8.onnx")
 
         log.info("[LLM] Loading ONNX sessions ...")
-        self.initial_session = create_onnx_session(initial_path, provider, intra_threads=4)
-        self.decode_session = create_onnx_session(decode_path, provider, intra_threads=4)
+        self.initial_session = create_onnx_session(initial_path, provider)
+        self.decode_session = create_onnx_session(decode_path, provider)
 
         # Dummy inputs for llm_embed.onnx (unused outputs are computed but discarded)
         self._dummy_token_ids = np.array([0], dtype=np.int64)
@@ -586,7 +595,7 @@ class FlowOnnxInference:
         flow_prep_path = str(self.onnx_dir / "flow_prep_mobile.onnx")
         if not os.path.exists(flow_prep_path):
             flow_prep_path = str(self.onnx_dir / "flow_prep.onnx")
-        self.flow_prep_session = create_onnx_session(flow_prep_path, provider, intra_threads=16)
+        self.flow_prep_session = create_onnx_session(flow_prep_path, provider)
 
         # Load DiT estimator ONNX (tuned threads for heavy transformer)
         # Priority: FFN INT8 > mobile FP32 > original
@@ -597,7 +606,7 @@ class FlowOnnxInference:
             if not os.path.exists(dit_path):
                 dit_path = str(self.onnx_dir / "dit_estimator.onnx")
         # DiT is the main bottleneck — use all available CPU cores
-        self.dit_session = create_onnx_session(dit_path, provider, intra_threads=16)
+        self.dit_session = create_onnx_session(dit_path, provider, intra_threads=0)
 
     def run(self, speech_tokens, prompt_tokens, prompt_speech_feat, speaker_embedding):
         """Run flow matching inference.
@@ -715,7 +724,7 @@ class HiFTOnnxInference:
     def __init__(self, onnx_dir):
         log.info("[HiFT] Loading HiFT ONNX ...")
         provider = "CUDAExecutionProvider" if "CUDAExecutionProvider" in ort.get_available_providers() else "CPUExecutionProvider"
-        self.session = create_onnx_session(str(Path(onnx_dir) / "hift.onnx"), provider, intra_threads=16)
+        self.session = create_onnx_session(str(Path(onnx_dir) / "hift.onnx"), provider)
 
     def run(self, mel_spectrogram):
         """Convert mel spectrogram to audio.
@@ -751,7 +760,8 @@ def main():
     parser.add_argument("--prompt_text", default="", help="Prompt text (auto-generated if empty)")
     parser.add_argument("--tts_text", default=DEFAULT_TTS_TEXT, help="Text to synthesize")
     parser.add_argument("--output", default=DEFAULT_OUTPUT, help="Output WAV file")
-    parser.add_argument("--use_int8", action="store_true", help="Use INT8 quantized LLM models")
+    parser.add_argument("--use_int8", action="store_true", help="Use INT8 quantized LLM for both initial+decode (lower quality)")
+    parser.add_argument("--use_fp32", action="store_true", help="Use FP32 LLM for both initial+decode (highest quality, more memory)")
     args = parser.parse_args()
 
     print("=" * 70)
@@ -760,7 +770,12 @@ def main():
     print(f"Reference WAV: {args.ref_wav}")
     print(f"TTS text:      {args.tts_text}")
     print(f"Output:        {args.output}")
-    print(f"Use INT8:      {args.use_int8}")
+    if args.use_int8:
+        print(f"LLM mode:      INT8 initial + INT8 decode")
+    elif args.use_fp32:
+        print(f"LLM mode:      FP32 initial + FP32 decode")
+    else:
+        print(f"LLM mode:      FP32 initial + INT8 decode (default)")
     print()
 
     # Validate inputs
@@ -824,7 +839,7 @@ def main():
     print("=" * 70)
 
     try:
-        llm = LLMOnnxInference(MODEL_DIR, ONNX_DIR, use_int8=args.use_int8)
+        llm = LLMOnnxInference(MODEL_DIR, ONNX_DIR, use_int8=args.use_int8, use_fp32=args.use_fp32)
         t_llm_start = time.time()
         speech_tokens = llm.run(preproc_data)
         timings["llm"] = time.time() - t_llm_start
