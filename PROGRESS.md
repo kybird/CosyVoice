@@ -1238,3 +1238,111 @@ python test_onnx_pipeline.py --use_fp32         # FP32 both (최고 품질, 느�
 | flow_prep_mobile.onnx | FP32 | 4 MB |
 | hift.onnx | FP32 | 327 MB |
 | llm_embed.onnx | FP32 | 566 MB |
+
+---
+
+## 21. [2026-05-29] Flutter 테스트 앱 — CosyVoice3 ONNX Dart 포팅
+
+### 21.1 목표
+
+Python ONNX 파이프라인을 Flutter(Dart)로 포팅하여 Android + Windows에서 온디바이스 TTS 동작 검증.
+
+### 21.2 프로젝트 구조
+
+```
+cosyvoice_test_app/
+├── lib/
+│   ├── main.dart                        — Material UI (텍스트 입력 + Play 버튼)
+│   └── pipeline/
+│       ├── cosyvoice_pipeline.dart      — 파이프라인 오케스트레이터
+│       ├── preprocessing.dart           — WAV 로드, mel 추출, 토크나이저
+│       ├── llm_inference.dart           — LLM prefill + autoregressive decode
+│       ├── flow_inference.dart          — DiT ODE solver (CFG)
+│       ├── hift_inference.dart          — HiFT vocoder
+│       ├── bpe_tokenizer.dart           — GPT-2 BPE 토크나이저 (순수 Dart)
+│       ├── constants.dart               — 특수 토큰 ID, 모델 경로 등
+│       └── tensor_utils.dart            — softmax, logSoftmax, topKSample, randomNormal
+├── pubspec.yaml                         — onnxruntime_v2, audioplayers 의존
+├── android/                             — Android 플랫폼
+└── windows/                             — Windows 플랫폼
+```
+
+### 21.3 사용 패키지
+
+| 패키지 | 버전 | 용도 |
+|--------|------|------|
+| `onnxruntime_v2` | ^1.0.0 | ONNX Runtime (production `tts_reader` 앱과 동일) |
+| `audioplayers` | ^6.1.0 | 오디오 재생 |
+| `path_provider` | ^2.1.0 | 외부 저장소 경로 |
+
+### 21.4 BPE 토크나이저 포팅 (순수 Dart)
+
+HuggingFace `tokenizer.json` 기반 GPT-2 BPE를 순수 Dart로 구현.
+
+**해결한 3가지 버그:**
+
+| # | 문제 | 원인 | 해결 |
+|---|------|------|------|
+| 1 | `_byteToChar` 매핑 불일치 | Python `bytes_to_unicode()` 하드코딩 오타 | 프로그래밍 방식으로 생성: `range(33,127) + range(161,173) + range(174,256)` |
+| 2 | Byte 34(큰따옴표) 누락 | Good bytes 리스트에서 34번 바이트 빠짐 → 이후 모든 매핑 1칸씩 어긋남 | 34를 good bytes에 추가 |
+| 3 | 한국어 토큰화 실패 | pre-tokenizer 미구현 (BPE 직접 적용) | GPT-2 정규식 pre-tokenizer 추가: `[^\r\n\p{L}\p{N}]?\p{L}+\|\p{N}\|...` |
+
+**검증 결과 (Python과 완전 일치):**
+
+| 입력 | Python | Dart | 일치 |
+|------|--------|------|------|
+| English | `[2610, 525, 264, 10950, 17847, 13]` | `[2610, 525, 264, 10950, 17847, 13]` | ✅ |
+| Korean | `[126246, 144370, 91145, 11, 63757, 138685, 38231, 13]` | `[126246, 144370, 91145, 11, 63757, 138685, 38231, 13]` | ✅ |
+| Full prompt (20 tokens) | — | — | ✅ |
+
+### 21.5 특수 토큰 ID 수정
+
+| 토큰 | 이전 | 수정 후 | 계산 |
+|------|------|---------|------|
+| `sosToken` | 6560 | **6561** | SPEECH_TOKEN_SIZE + 0 |
+| `eosToken` | 6561 | **6562** | SPEECH_TOKEN_SIZE + 1 |
+| `taskIdToken` | 6562 | **6563** | SPEECH_TOKEN_SIZE + 2 |
+
+### 21.6 파이프라인 Dart 포팅
+
+Python 참조 스크립트(`benchmark/test_onnx_pipeline.py`, 936줄)를 기반으로 전체 파이프라인을 Dart로 포팅:
+
+| 컴포넌트 | Python | Dart | 상태 |
+|----------|--------|------|------|
+| WAV 로드/리샘플 | soundfile + scipy | dart:math + 직접 구현 | ✅ |
+| Mel 추출 (128-bin) | mel_16k_128bin.onnx | ONNX Runtime Dart | ✅ |
+| Speech tokenizer | speech_tokenizer_v3.onnx | ONNX Runtime Dart | ✅ |
+| Speaker embedding | campplus.onnx | ONNX Runtime Dart | ✅ |
+| BPE 토크나이저 | HuggingFace transformers | 순수 Dart 구현 | ✅ |
+| LLM (embed+initial+decode) | llm_embed/initial/decode.onnx | ONNX Runtime Dart | ✅ |
+| Sampling (top-k + rep penalty) | numpy | 순수 Dart (tensor_utils.dart) | ✅ |
+| Flow (prep + DiT ODE) | flow_prep + dit_estimator.onnx | ONNX Runtime Dart | ✅ |
+| HiFT vocoder | hift.onnx | ONNX Runtime Dart | ✅ |
+| 오디오 재생 | soundfile + play | audioplayers | ✅ |
+
+### 21.7 동작 확인
+
+- **한국어 음성 합성 성공** ✅ — 사용자 확인 "잘된다"
+- LLM: 84 speech tokens 생성, 3.36초 오디오, max_amplitude 0.99
+- Python 참조와 동일한 동작 (레퍼런스 음성 프롬프트 텍스트 불일치 시에도 동일 패턴)
+
+### 21.8 성능 (Windows, 디버그 빌드)
+
+| 컴포넌트 | RTF | 비고 |
+|----------|-----|------|
+| LLM | ~3.2 | 디코딩 스텝당 3회 ONNX 호출 (embed+decode+logits) |
+| Flow | ~0.4 | ODE 10 steps |
+| **총계** | **~3.6** | 최적화 전 |
+
+### 21.9 모델 로드 방식
+
+ONNX 모델은 기기 외부 저장소에서 로드 (번들 자산이 아님, 총 ~2.3GB):
+- Android: 외부 저장소 경로
+- Windows: 로컬 디스크 경로
+
+### 21.10 다음 단계
+
+1. **lm_head 가중치 추출** — `llm_embed.onnx`에서 `onnx::MatMul_10` (shape [896, 6761]) 추출 → Dart에서 직접 logits 계산 → ONNX 호출 1회/스텝 절감 (~33% LLM 속도 향상 예상)
+2. Flow RTF 최적화
+3. Android 디바이스 테스트
+4. 릴리즈 빌드 성능 측정
