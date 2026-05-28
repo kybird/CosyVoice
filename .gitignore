@@ -31,6 +31,10 @@ Thumbs.db
 .env
 *.egg
 
+# Conda environment spec (recreate with: conda env create -f environment.yaml)
+# Uncomment the next line if you don't want to track environment.yaml in git
+# environment.yaml
+
 # Temp / profiling
 dit_profile*
 *.json.bak
@@ -39,3 +43,6 @@ dit_profile*
 deploy/key.properties
 deploy/setup_keystore_env.bat
 deploy/*.jks
+
+# Playwright MCP
+.playwright-mcp/
