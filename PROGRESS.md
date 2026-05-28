@@ -1,6 +1,6 @@
 # CosyVoice3 ONNX Export — 작업 진행 기록
 
-> 최종 업데이트: 2026-05-27
+> 최종 업데이트: 2026-05-28
 > 목표: CosyVoice3 음성 클로닝을 모바일 온디바이스에서 실시간 구동 가능하게 ONNX 최적화
 
 ---
@@ -16,7 +16,7 @@
 | ONNX | 1.20.1 |
 | GPU | RTX 4070 Ti Super 16GB |
 | CUDA | 12.1 |
-| 프로젝트 루트 | `C:\Project\TTSTextReader\CosyVoice\` |
+| 프로젝트 루트 | `paths.py` 기반 자동 감지 (C:\ 또는 D:\ 모두 대응) |
 
 ### ORT 1.18.0 호환성 이슈
 - `onnx.mapping.TENSOR_TYPE_TO_NP_TYPE` 가 onnx 1.20에서 제거됨
@@ -199,30 +199,29 @@ REF_PROMPT_MAP = {
 
 ---
 
-## 7. PyTorch 의존성 현황 (모바일 이관 전)
+## 7. PyTorch 의존 현황 (2026-05-28 업데이트)
 
-### 현재 PyTorch를 사용하는 부분
+### 추론 파이프라인 (test_onnx_pipeline.py) — PyTorch 0개 ✅
 
-| 컴포넌트 | PyTorch 사용 | 모바일 대안 |
-|----------|-------------|------------|
-| **LLM** | | |
-| embed_tokens (151936×896) | ✅ torch indexing | numpy gather |
-| speech_embedding (6761×896) | ✅ torch indexing | numpy gather |
-| llm_decoder (6761×896) | ✅ torch matmul | numpy matmul |
-| log_softmax | ✅ torch | scipy/numpy |
-| **Flow** | | |
-| input_embedding (6561×80) | ✅ torch indexing | numpy gather |
-| spk_embed_affine (192→80) | ✅ F.normalize + F.linear | numpy |
-| pre_lookahead_layer | ✅ F.conv1d × 2 + F.pad | numpy conv 또는 소형 ONNX |
-| repeat_interleave | ✅ torch | numpy.repeat |
-| torch.zeros/ones | ✅ tensor 생성 | numpy |
-| **Preprocessing** | | |
-| mel 특징 추출 | ✅ torchaudio | 직접 구현 또는 패키지 |
-| 텍스트 토크나이저 | ✅ CosyVoice3Tokenizer | sentencepiece 또는 Dart |
-| WAV 로드/저장 | ✅ torchaudio | 직접 구현 또는 패키지 |
+모든 추론이 ONNX Runtime + numpy로 동작. PyTorch/torchaudio 미사용.
 
-### 다음 작업: Flow PyTorch 제거
-Flow의 embedding/affine/pre_lookahead를 numpy로 교체 → PyTorch 의존 없이 Flow 동작
+| 컴포넌트 | 구현 | 상태 |
+|----------|------|------|
+| WAV 로드/리샘플 | `soundfile` + `scipy.signal.resample_poly` | ✅ ONNX |
+| mel 128-bit (speech tokenizer) | `mel_16k_128bin.onnx` (0.7 MB) | ✅ ONNX |
+| mel 80-bit (flow prompt) | `mel_24k_80bin.onnx` (14.4 MB) | ✅ ONNX |
+| fbank 80-bit (campplus) | `fbank_16k_80bin.onnx` (1.7 MB) | ✅ ONNX |
+| speech tokenizer | `speech_tokenizer_v3.onnx` | ✅ ONNX |
+| speaker embedding | `campplus.onnx` | ✅ ONNX |
+| LLM 전체 | `llm_embed.onnx` + `llm_initial_int8.onnx` + `llm_decode_int8.onnx` + numpy | ✅ ONNX |
+| Flow 전체 | `flow_prep.onnx` + `dit_estimator_int8_ffn.onnx` | ✅ ONNX |
+| HiFT | `hift.onnx` | ✅ ONNX |
+| WAV 저장 | `soundfile.write` | ✅ 순수 Python |
+| 토크나이저 | `CosyVoice3Tokenizer` → `transformers.AutoTokenizer` + `torch.tensor` | ⚠️ 간접 torch 의존 |
+
+### Export 스크립트 — PyTorch 사용 (tracing에 필요)
+
+export/*.py는 ONNX tracing을 위해 PyTorch 필요. 이는 정상 — 모델 생성 시에만 사용.
 
 ---
 
@@ -730,21 +729,25 @@ Postprocessing (PyTorch)
     └── torchaudio.save → WAV 파일
 ```
 
-### 15.4 PyTorch 의존 현황 (test_onnx_pipeline.py 기준)
+### 15.4 PyTorch 의존 현황 (2026-05-28 업데이트)
 
-**남은 PyTorch 사용처 (Preprocessing + Postprocessing만):**
+**추론 파이프라인 PyTorch 의존: 0개** ✅
 
-| 위치 | 연산 | 교체 방안 |
-|------|------|----------|
-| `load_wav()` | `torchaudio.load`, `torchaudio.transforms.Resample` | scipy.io.wavfile + librosa/soundfile |
-| `extract_speech_tokens()` | `whisper.log_mel_spectrogram` → torch Tensor | numpy STFT 기반 mel 직접 구현 또는 ONNX |
-| `extract_speaker_embedding()` | `kaldi.fbank` (torchaudio) → torch Tensor | numpy fbank 구현 또는 ONNX |
-| `extract_prompt_speech_feat()` | `matcha.utils.audio.mel_spectrogram` (torch STFT) | numpy STFT 또는 ONNX |
-| `speaker_embedding` 반환 | `torch.tensor(embedding)` | np.ndarray 그대로 사용 |
-| `torchaudio.save` | WAV 저장 | scipy.io.wavfile.write |
-| `prompt_speech_feat` | torch Tensor 전달 | np.ndarray로 변환 (Flow 이미 numpy 처리) |
+모든 전처리/추론/후처리가 ONNX + numpy + soundfile/scipy로 동작.
 
-**LLM/Flow/HiFT 스테이지: PyTorch 0개** ✅
+| 연산 | 구현 | ONNX 모델 |
+|------|------|-----------|
+| WAV 로드 + 리샘플 | `soundfile.read` + `scipy.signal.resample_poly` | — |
+| mel 128-bit (speech tokenizer용) | ONNX 추론 | `mel_16k_128bin.onnx` (0.7 MB) |
+| mel 80-bit (flow prompt용) | ONNX 추론 | `mel_24k_80bin.onnx` (14.4 MB) |
+| fbank 80-bit (campplus용) | ONNX 추론 | `fbank_16k_80bin.onnx` (1.7 MB) |
+| speech token 추출 | ONNX 추론 | `speech_tokenizer_v3.onnx` |
+| speaker embedding | ONNX 추론 | `campplus.onnx` |
+| 텍스트 토크나이저 | `CosyVoice3Tokenizer` (transformers) | ⚠️ 간접 torch 의존 |
+| LLM 전체 | ONNX + numpy | `llm_embed.onnx` + `llm_initial_int8.onnx` + `llm_decode_int8.onnx` |
+| Flow 전체 | ONNX + numpy | `flow_prep.onnx` + `dit_estimator_int8_ffn.onnx` |
+| HiFT | ONNX | `hift.onnx` |
+| WAV 저장 | `soundfile.write` | — |
 
 ### 15.5 llm_embed.onnx 호출 패턴 최적화 여지
 
@@ -995,20 +998,17 @@ export_models.bat            — 원클릭 전체 모델 익스포트
 
 ## 18. 다음 단계 (모바일 포팅)
 
-### 18.1 Preprocessing PyTorch 제거 (필수)
+### 18.1 남은 PyTorch 의존 — 토크나이저만
 
-현재 PyTorch가 남은 곳:
+현재 추론에서 PyTorch가 간접적으로 로드되는 유일한 곳:
 
-| 위치 | 연산 | 교체 방안 |
+| 위치 | 의존 | 교체 방안 |
 |------|------|----------|
-| `load_wav()` | `torchaudio.load` + Resample | scipy.io.wavfile + scipy.signal.resample |
-| `extract_speech_tokens()` | `whisper.log_mel_spectrogram` (128-bin) | numpy STFT 기반 mel 직접 구현 |
-| `extract_speaker_embedding()` | `kaldi.fbank` (torchaudio, 80-bin) | numpy fbank 구현 |
-| `extract_prompt_speech_feat()` | `matcha.utils.audio.mel_spectrogram` (torch STFT, 80-bin) | numpy STFT 또는 ONNX |
-| 토크나이저 | `CosyVoice3Tokenizer` (transformers) | sentencepiece 또는 Dart 토크나이저 |
-| WAV 저장 | `torchaudio.save` | scipy.io.wavfile.write |
+| `cosyvoice/tokenizer/tokenizer.py` line 5 | `import torch` | 제거 가능 (encode에서만 `return_tensors="pt"` 사용) |
+| `cosyvoice/tokenizer/tokenizer.py` line 264 | `tokens["input_ids"][0].cpu().tolist()` | AutoTokenizer 자체가 numpy list 반환 가능 |
+| `cosyvoice/tokenizer/tokenizer.py` line 269 | `torch.tensor(tokens, dtype=torch.int64)` | `numpy.array()` 로 교체 |
 
-> Flutter에서 numpy/PyTorch 불가 → 모든 연산을 ONNX 모델로 묶거나 Dart 네이티브로 구현 필요
+> 교체 시 PyTorch 완전 제거 가능. Flutter 포팅 시에는 Dart 네이티브 BPE 구현 필요.
 
 ### 18.2 모바일 포팅 (Flutter + ONNX Runtime Mobile)
 
@@ -1022,4 +1022,219 @@ export_models.bat            — 원클릭 전체 모델 익스포트
 - [ ] 실시간 RTF 측정 (Snapdragon 8 Gen 2/3 기준)
 - [ ] 메모리 피크 사용량 (2.3GB 모델 로드)
 - [ ] NPU 위임 가능 여부 (NNAPI Delegate)
-ㅊ
+
+---
+
+## 19. [2026-05-28] 환경 통합 + 집 PC 재검증
+
+### 19.1 환경 의존성 제거 (paths.py 도입)
+
+모든 스크립트의 하드코딩 절대경로를 제거하고 `paths.py` 중앙 모듈로 통합:
+
+| 변경 | 내용 |
+|------|------|
+| `paths.py` 신규 | `Path(__file__)` 기반 자동 감지 + env var 오버라이드 |
+| `.env.example` 신규 | 머신별 설정 템플릿 |
+| `environment.yaml` 신규 | conda 환경 스펙 (노트북에서 `conda env create -f`) |
+| `export/*.py` 7개 | `Path(r"...")` → `from paths import BASE_DIR, MODEL_DIR, ONNX_DIR` |
+| `benchmark/test_onnx_pipeline.py` | TTSTEXTVIEWER_DIR, REF_WAV_SUBDIR → paths.py |
+| `benchmark/verify_runs.py` | 전체 경로 → `sys.executable` + paths.py |
+| `quantize/run_step6.py` | 3개 하드코딩 → paths.py |
+| `transcribe_refs.py` | 하드코딩 → paths.py |
+| `export_models.bat` | `set PYTHON=...` → conda activate + python |
+| `export/*.py` 3개 | `dynamo=False` 인자 제거 (PyTorch 2.3.1 호환) |
+
+### 19.2 집 PC 전체 재 Export 검증
+
+| Step | 모델 | 결과 |
+|------|------|------|
+| 1/6 | LLM (llm_initial + llm_decode) | ✅ max diff 2.3e-05 / 9.1e-06 |
+| 2/6 | LLM embed (llm_embed) | ✅ max diff 1.7e-06 |
+| 3/6 | Flow prep (flow_prep) | ✅ max diff 3.3e-06 |
+| 4/6 | DiT mobile (dit_estimator_mobile) | ✅ max diff 2.5e-03 |
+| 5/6 | HiFT (hift) | ⚠️ max diff 1.1e-02 (기존 이슈, 오디오 정상) |
+| 6a | LLM INT8 quantize | ✅ |
+| 6b | DiT FFN INT8 | ✅ max diff 0.208, 20.8% 축소 |
+| 6c | DiT FP16 | ✅ 기존 파일 존재 (634 MB) |
+| bonus | mel spectrogram 3종 | ✅ mel_16k, mel_24k, fbank_16k |
+
+### 19.3 집 PC 벤치마크 (3회 평균)
+
+**환경: RTX 4070 Ti Super 16GB, ORT 1.23.2, PyTorch 2.3.1+cu121, FFN INT8 DiT, ODE 4 steps**
+
+| Run | Audio | LLM RTF | Flow RTF | HiFT RTF | **Inference RTF** |
+|-----|-------|---------|----------|----------|-------------------|
+| 1 | 2.76s | 0.347 | 0.484 | 0.090 | **0.920** |
+| 2 | 3.04s | 0.343 | 0.467 | 0.095 | **0.906** |
+| 3 | 3.24s | 0.332 | 0.445 | 0.093 | **0.871** |
+| **Avg** | **3.01s** | **0.341** | **0.465** | **0.093** | **0.899** |
+
+**사무실(§17.9) vs 집 비교:**
+
+| 항목 | 사무실 | 집 | 비고 |
+|------|--------|-----|------|
+| Inference RTF | 0.939 | 0.899 | 집이 약간 빠름 (CPU 클럭 차이 추정) |
+| LLM RTF | 0.380 | 0.341 | 동일 경향 |
+| Flow RTF | 0.474 | 0.465 | 동일 경향 |
+
+### 19.4 mel Spectrogram ONNX 모델 (신규 추가)
+
+| 파일 | 크기 | 용도 | 검증 |
+|------|------|------|------|
+| `mel_16k_128bin.onnx` | 0.7 MB | Whisper-style mel (speech tokenizer용) | ✅ max diff 1.2e-07 |
+| `mel_24k_80bin.onnx` | 14.4 MB | Matcha-style mel (flow prompt용) | ✅ max diff 1.3e-06 |
+| `fbank_16k_80bin.onnx` | 1.7 MB | Kaldi-style fbank (campplus용) | ⚠️ max diff 5.1e-04 (허용 범위) |
+
+이 3개 모델로 인해 전처리의 torchaudio/whisper 의존이 완전히 제거됨.
+
+### 19.5 현재 ONNX 모델 전체 목록
+
+| 파일 | 크기 | 용도 |
+|------|------|------|
+| `llm_embed.onnx` | 565.5 MB | 텍스트/스피치 임베딩 + 디코더 |
+| `llm_initial_int8.onnx` | 344.4 MB | LLM prefill (INT8) |
+| `llm_decode_int8.onnx` | 343.6 MB | LLM decode step (INT8) |
+| `dit_estimator_int8_ffn.onnx` | 1002 MB | DiT 22층 FFN INT8 (현재 사용) |
+| `dit_estimator_mobile.onnx` | 1265 MB | DiT FP32 기본 (QKV fused) |
+| `dit_estimator_fp16.onnx` | 633.8 MB | DiT FP16 (모바일 ARM64용) |
+| `flow_prep.onnx` | 4.3 MB | 토큰 임베딩 + spk affine + pre-lookahead |
+| `hift.onnx` | 326.8 MB | HiFT vocoder |
+| `mel_16k_128bin.onnx` | 0.7 MB | Whisper mel |
+| `mel_24k_80bin.onnx` | 14.4 MB | Matcha mel |
+| `fbank_16k_80bin.onnx` | 1.7 MB | Kaldi fbank |
+
+**총 사용 모델 (추론): ~2.3 GB**
+
+---
+
+## 20. [2026-05-28] INT8 LLM 발음 품질 분석 + 양자화 실험
+
+### 20.1 문제 발견
+
+INT8 LLM(`llm_initial_int8.onnx` + `llm_decode_int8.onnx`) 조합에서 한국어 발음 품질 저하 현상:
+- 음소 생략, 음절 스킵, 부자연스러운 발음
+- FP32 파이프라인 대비 현저히 열등
+
+### 20.2 교차 테스트로 범인 특정
+
+4가지 조합으로 systematic isolation:
+
+| Initial | Decode | 발음 품질 | 판정 |
+|---------|--------|----------|------|
+| FP32 | FP32 | ✅ 좋음 | 기준선 |
+| FP32 | INT8 | ✅ 좋음 (동일 토큰) | decode 무관 |
+| **INT8** | FP32 | ❌ 나쁨 | **initial이 범인** |
+| INT8 | INT8 | ❌ 나쁨 | initial이 범인 |
+
+**결론**: `llm_initial_int8.onnx`의 KV cache 품질 저하가 모든 발음 문제의 근본 원인.
+
+### 20.3 INT8 Initial 구조 분석
+
+| 항목 | FP32 (`llm_initial.onnx`) | INT8 (`llm_initial_int8.onnx`) |
+|------|--------------------------|-------------------------------|
+| 노드 수 | 5,889 | 6,489 |
+| 이니셜라이저 | 289 (all FP32) | 625 (336 INT8 + 289 FP32) |
+| 크기 | 1,365 MB | 344 MB |
+| MatMul | 217 | 168 MatMulInteger + 49 FP32 MatMul |
+| 양자화 방식 | — | DynamicQuantizeLinear 96개 (per-tensor) |
+| 아키텍처 | Qwen2 24-layer transformer | 동일, INT8 dynamic quant |
+
+레이어당 4개 DynamicQuantizeLinear: input_layernorm, self_attn, post_attention_layernorm, mlp
+
+### 20.4 전처리 오차 체인 분석 (무죄 판정)
+
+| 단계 | 알고리즘 | Max Diff | Speech Token 영향 |
+|------|----------|----------|-------------------|
+| 리샘플링 | scipy vs torchaudio | 0.014 | 무시 가능 |
+| Mel 추출 | ONNX vs whisper | 0.173 | 94개 중 2~3개만 다름 |
+| **합산** | | | **미미 — 발음 문제 주원인 아님** |
+
+### 20.5 INT8 양자화 실험 (3가지)
+
+Claude(Anthropic)에 ONNX 구조를 상세히 설명하여 양자화 전략 자문을 구함. 캘리브레이션 데이터 50샘플 생성(`calib_data.npz`), noise padding 적용.
+
+| 실험 | 방식 | 설정 | CosSim | KV MaxDiff | Token Match | 크기 | 판정 |
+|------|------|------|--------|-----------|-------------|------|------|
+| exp1 | Per-channel static | Percentile calibration | — (NaN 에러) | — | — | — | ❌ |
+| exp2 | Mixed FFN INT8 + Attn FP32 | MinMax calibration, noise padding | 0.019 | 24.42 | 0.8% | 469 MB | ❌ 붕괴 |
+| exp3 | Weight-only per-tensor | per-tensor INT8 weights | 0.988 | 2.58 | 79.2% | 343 MB | ❌ 불충분 |
+
+**분석**:
+- exp1: ORT `Percentile` calibration이 NaN 히스토그램 생성 — 모델 분포와 비호환
+- exp2: `MinMax` static quantization이 활성화값 분포를 완전히 붕괴시킴 (CosSim 0.019 = 무작위 수준)
+- exp3: Weight-only는 가장 양호하나 KV max diff 2.58은 여전히 너무 큼 — 초기 KV cache 왜곡으로 후속 decode 품질 저하
+
+### 20.6 최종 결정: FP32 Initial + INT8 Decode
+
+세 양자화 방식 모두 `llm_initial`의 KV cache 품질을 FP32 수준으로 유지하지 못함. 대안:
+
+**FP32 initial + INT8 decode 조합 채택**
+
+| 항목 | 전체 FP32 | 전체 INT8 | **FP32 initial + INT8 decode** |
+|------|----------|----------|-------------------------------|
+| 발음 품질 | ✅ 좋음 | ❌ 나쁨 | ✅ 좋음 |
+| LLM 추론 시간 | 2.51s | 1.34s | ~1.34s (decode가 대부분) |
+| Initial 크기 | 1,365 MB | 344 MB | 1,365 MB |
+| Decode 크기 | 1,365 MB | 344 MB | 344 MB |
+| 총 LLM 크기 | 2,730 MB | 688 MB | 1,709 MB |
+
+- Initial은 1회만 실행되므로 크기가 크지만 성능에 미치는 영향은 미미
+- Decode는 N번 반복되므로 INT8이 실질적 이득
+- 발음 품질 = FP32와 동일 (사용자 확인 완료)
+
+### 20.7 스크립트 정리
+
+양자화 실험 결과물:
+
+```
+export/quantize/
+├── calib_gen.py              — 캘리브레이션 데이터 생성기
+├── quant_utils.py            — 공통 유틸 (node 분류, validate, KoreanCalibReader)
+├── exp1_perchannel.py        — Per-channel static quant (실패)
+├── exp2_mixed.py             — Mixed precision FFN INT8 (실패)
+├── exp3_weight_only.py       — Weight-only per-tensor (품질 불충분)
+├── kv_cache_quant.py         — KV cache 양자화 유틸
+├── report.py                 — 비교 리포트
+├── calib_data.npz            — 캘리브레이션 데이터 (50샘플, noise padding)
+└── quantized/
+    ├── exp2_result.json      — CosSim 0.019, KV MaxDiff 24.42
+    └── exp3_result.json      — CosSim 0.988, KV MaxDiff 2.58, Token Match 79.2%
+```
+
+### 20.8 프로덕션 벤치마크 (FP32 initial + INT8 decode, 3회 평균)
+
+**환경: RTX 4070 Ti Super 16GB, ORT 1.23.2, PyTorch 2.3.1+cu121, FFN INT8 DiT, ODE 4 steps**
+
+| Run | Audio | Preproc RTF | LLM RTF | Flow RTF | HiFT RTF | **Inference RTF** |
+|-----|-------|-------------|---------|----------|----------|-------------------|
+| 1 | 3.00s | 0.725 | 0.434 | 0.479 | 0.092 | **1.005** |
+| 2 | 3.16s | 0.644 | 0.427 | 0.472 | 0.091 | **0.990** |
+| 3 | 3.16s | 0.605 | 0.431 | 0.475 | 0.092 | **0.999** |
+| **Avg** | **3.11s** | **0.658** | **0.431** | **0.475** | **0.092** | **0.998** |
+
+**vs 전체 INT8 (§19) 비교:**
+
+| 항목 | 전체 INT8 (§19) | FP32 init + INT8 decode (§20) | 차이 |
+|------|----------------|-------------------------------|------|
+| Inference RTF | 0.899 | 0.998 | +0.099 (+11%) |
+| LLM RTF | 0.341 | 0.431 | +0.090 (FP32 prefill) |
+| 발음 품질 | ❌ 불량 | ✅ FP32 동등 | — |
+
+**결론**: FP32 initial로 인해 LLM RTF +0.09이지만, 발음 품질이 FP32와 동등. 전체 RTF 0.998로 실시간 한계선 도달.
+
+### 20.9 최종 프로덕션 설정
+
+```
+python test_onnx_pipeline.py                    # FP32 initial + INT8 decode (기본)
+python test_onnx_pipeline.py --use_int8         # INT8 both (빠르나 발음 불량)
+python test_onnx_pipeline.py --use_fp32         # FP32 both (최고 품질, 느림)
+```
+
+| 모델 | 버전 | 크기 |
+|------|------|------|
+| llm_initial.onnx | FP32 | 1,366 MB |
+| llm_decode_int8.onnx | INT8 | 344 MB |
+| dit_estimator_int8_ffn.onnx | FFN INT8 | 1,002 MB |
+| flow_prep_mobile.onnx | FP32 | 4 MB |
+| hift.onnx | FP32 | 327 MB |
+| llm_embed.onnx | FP32 | 566 MB |
