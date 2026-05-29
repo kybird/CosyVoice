@@ -173,24 +173,30 @@ class FlowInference {
       final vCond = flattenToFloat32(ditCondOut[0]!.value);
       (ditCondOut[0] as OrtValueTensor).release();
 
-      // Unconditional call (reuse x, mask, t; use zero buffers)
-      final uncondInputs = <String, OrtValue>{
-        'x': xOrt,
-        'mask': maskOrt,
-        'mu': zerosMuOrt,
-        't': tOrt,
-        'spks': zerosSpksOrt,
-        'cond': zerosCondOrt,
-      };
-      final ditUncondOut = _ditSession.run(runOpts, uncondInputs);
-      final vUncond = flattenToFloat32(ditUncondOut[0]!.value);
-      (ditUncondOut[0] as OrtValueTensor).release();
+      // CFG skip: on later steps (low t), unconditional pass has minimal effect
+      final applyCfg = tVal >= cfgSkipThreshold;
+      var vUncond = vCond; // default: no CFG (reuse vCond, diff is zero)
+      if (applyCfg) {
+        // Unconditional call (reuse x, mask, t; use zero buffers)
+        final uncondInputs = <String, OrtValue>{
+          'x': xOrt,
+          'mask': maskOrt,
+          'mu': zerosMuOrt,
+          't': tOrt,
+          'spks': zerosSpksOrt,
+          'cond': zerosCondOrt,
+        };
+        final ditUncondOut = _ditSession.run(runOpts, uncondInputs);
+        vUncond = flattenToFloat32(ditUncondOut[0]!.value);
+        (ditUncondOut[0] as OrtValueTensor).release();
+      }
 
       // Release per-step OrtValues (x and t)
       xOrt.release();
       tOrt.release();
 
       // CFG: dphi_dt = v_cond + guidanceScale * (v_cond - v_uncond)
+      // When CFG is skipped, vUncond == vCond, so this simplifies to dphi_dt = v_cond
       for (int i = 0; i < x.length; i++) {
         dphiDt[i] = vCond[i] + guidanceScale * (vCond[i] - vUncond[i]);
       }

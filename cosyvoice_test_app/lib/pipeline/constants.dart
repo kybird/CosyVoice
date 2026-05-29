@@ -23,6 +23,11 @@ const int spkDim = 80;
 const double guidanceScale = 0.7;
 const int nTimesteps = 4;
 
+// CFG skip: skip unconditional pass on steps where t < threshold.
+// Flow Matching t=1 is pure noise (CFG critical), t=0 is final (CFG negligible).
+// Set to 0.0 to disable (always apply CFG on all steps).
+const double cfgSkipThreshold = 0.3;
+
 // Sampling parameters (Repetition Aware Sampling)
 const int samplingTopK = 10;
 const double repetitionPenalty = 1.2;
