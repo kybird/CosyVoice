@@ -220,10 +220,17 @@ class CosyVoicePipeline {
     await writeWav(outputPath, normalizedAudio, sampleRate);
 
     final audioDuration = audio.length / sampleRate;
-    pLog('═══ RESULT: ${audioDuration.toStringAsFixed(3)}s audio, ${speechTokens.length} speech tokens, total mel=$melLen ═══');
     final totalInference =
         (timings['llm'] ?? 0) + (timings['flow'] ?? 0) + (timings['hift'] ?? 0);
     final totalRtf = audioDuration > 0 ? totalInference / audioDuration : 0.0;
+    final llmRtf = audioDuration > 0
+        ? (timings['llm'] ?? 0) / audioDuration
+        : 0.0;
+    final flowRtf = audioDuration > 0
+        ? (timings['flow'] ?? 0) / audioDuration
+        : 0.0;
+    pLog('═══ RESULT: ${audioDuration.toStringAsFixed(3)}s audio, ${speechTokens.length} speech tokens, total mel=$melLen ═══');
+    pLog('  RTF total=${totalRtf.toStringAsFixed(2)} | LLM=${llmRtf.toStringAsFixed(2)} (${(timings['llm'] ?? 0).toStringAsFixed(2)}s) | Flow=${flowRtf.toStringAsFixed(2)} (${(timings['flow'] ?? 0).toStringAsFixed(2)}s) | HiFT=${(timings['hift'] ?? 0).toStringAsFixed(2)}s | Preproc=${(timings['preprocessing'] ?? 0).toStringAsFixed(2)}s');
 
     return PipelineResult(
       outputPath: outputPath,

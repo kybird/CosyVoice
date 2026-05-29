@@ -7,7 +7,7 @@ import 'tensor_utils.dart';
 import 'preprocessing.dart';
 
 /// LLM autoregressive decoding using ONNX Runtime.
-/// All embedding/decoder/sampling via llm_embed.onnx + tensor math.
+/// Embeddings and logits via llm_embed.onnx.
 class LlmInference {
   late OrtSession _embedSession;
   late OrtSession _initialSession;
@@ -103,9 +103,9 @@ class LlmInference {
     return flat;
   }
 
-  /// Apply linear decoder to hidden state to get logits.
-  /// hiddenState: (1, seq, hiddenSize) flat
-  /// Returns Float32List of shape (1, seq, llmVocabSize) flat
+  /// Apply linear decoder to hidden state to get logits via ONNX.
+  /// hiddenState: flat Float32List of length hiddenSize (896)
+  /// Returns Float32List of length llmVocabSize (6761)
   Future<Float32List> _decodeHidden(Float32List hiddenState) async {
     final runOpts = OrtRunOptions();
     final inputs = {
@@ -118,8 +118,13 @@ class LlmInference {
     };
 
     final outputs = _embedSession.run(runOpts, inputs);
+    // Release unused outputs (text_emb, speech_emb)
+    (outputs[0] as OrtValueTensor).release();
+    (outputs[1] as OrtValueTensor).release();
     // Output 2 = logits (1, 1, 6761)
-    return flattenToFloat32(outputs[2]!.value);
+    final logits = flattenToFloat32(outputs[2]!.value);
+    (outputs[2] as OrtValueTensor).release();
+    return logits;
   }
 
   /// Run LLM autoregressive decoding.
@@ -225,11 +230,11 @@ class LlmInference {
     }
     outTokens.add(topId);
 
-    // KV cache from initial outputs — indices 1..48
-    // Each layer has past_key and past_value
-    List<Float32List> kvCache = [];
+    // KV cache from initial outputs — keep as OrtValue for zero-copy reuse
+    // Each layer has past_key and past_value (indices 1..48)
+    List<OrtValue> kvCacheOrt = [];
     for (int i = 1; i < initialOutputs.length; i++) {
-      kvCache.add(flattenToFloat32(initialOutputs[i]!.value));
+      kvCacheOrt.add(initialOutputs[i]!);
     }
 
     // ── Autoregressive decode loop ──
@@ -247,30 +252,30 @@ class LlmInference {
       decodeInputs['position_ids'] =
           OrtValueTensor.createTensorWithDataList(positionIds, [1, 1]);
 
-      // Add KV cache as inputs
-      // KV cache shape: (1, numKvHeads, seqLen, headDim)
-      // flat length = numKvHeads * seqLen * headDim = 128 * seqLen
+      // Add KV cache as inputs (zero-copy: pass OrtValue pointers directly)
       for (int layerIdx = 0; layerIdx < numLayers; layerIdx++) {
-        final kvSeqLen = kvCache[layerIdx * 2].length ~/ (numKvHeads * headDim);
-        decodeInputs['past_key_${layerIdx}_in'] =
-            OrtValueTensor.createTensorWithDataList(
-                kvCache[layerIdx * 2], [1, numKvHeads, kvSeqLen, headDim]);
-        decodeInputs['past_value_${layerIdx}_in'] =
-            OrtValueTensor.createTensorWithDataList(
-                kvCache[layerIdx * 2 + 1], [1, numKvHeads, kvSeqLen, headDim]);
+        decodeInputs['past_key_${layerIdx}_in'] = kvCacheOrt[layerIdx * 2];
+        decodeInputs['past_value_${layerIdx}_in'] = kvCacheOrt[layerIdx * 2 + 1];
       }
 
       final decodeOutputs = _decodeSession.run(runOpts, decodeInputs);
 
-      // Get hidden state
+      // Get hidden state (small: 896 floats)
       final hidden = flattenToFloat32(decodeOutputs[0]!.value);
+      (decodeOutputs[0] as OrtValueTensor).release();
 
-      // Update KV cache
-      final newKvCache = <Float32List>[];
-      for (int i = 1; i < decodeOutputs.length; i++) {
-        newKvCache.add(flattenToFloat32(decodeOutputs[i]!.value));
+      // Release small input OrtValues created this step
+      (decodeInputs['inputs_embeds'] as OrtValueTensor).release();
+      (decodeInputs['position_ids'] as OrtValueTensor).release();
+
+      // Update KV cache: release old OrtValues, keep new ones (zero-copy)
+      for (final ort in kvCacheOrt) {
+        (ort as OrtValueTensor).release();
       }
-      kvCache = newKvCache;
+      kvCacheOrt = <OrtValue>[];
+      for (int i = 1; i < decodeOutputs.length; i++) {
+        kvCacheOrt.add(decodeOutputs[i]!);
+      }
 
       // Decode token
       final stepLogits = await _decodeHidden(hidden);
@@ -305,6 +310,11 @@ class LlmInference {
       if ((step + 1) % 20 == 0) {
         pLog('[LLM] Step ${step + 1}/$maxLen, tokens=${outTokens.length}, last=${outTokens.last}', tag: 'LLM');
       }
+    }
+
+    // Release remaining KV cache OrtValues
+    for (final ort in kvCacheOrt) {
+      (ort as OrtValueTensor).release();
     }
 
     pLog('[LLM] Done: ${outTokens.length} raw tokens, ${_filterTokens(outTokens).length} after filter', tag: 'LLM');
