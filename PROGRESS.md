@@ -1464,7 +1464,7 @@ Prepr  █░░░░░░░░░░░░░░░░░░░░   ~4%  (0
 - KV cache zero-copy 최적화는 아키텍처 무관하게 동일하게 적용됨
 
 **모바일에서 실시간 달성을 위한 추가 최적화 필요:**
-1. Flow 0.357 최적화 (KV cache와 동일한 OrtValue 재사용 패턴 적용 가능성)
+1. ~~Flow 0.357 최적화~~ ✅ 완료 (아래 §22.10 참조)
 2. FP16 DiT (634MB) — ARM64 네이티브 FP16 지원
 3. INT4 양자화 — 모바일용 추가 가중치 압축
 
@@ -1473,20 +1473,70 @@ Prepr  █░░░░░░░░░░░░░░░░░░░░   ~4%  (0
 | 파일 | 변경 내용 |
 |------|----------|
 | `cosyvoice_test_app/lib/pipeline/llm_inference.dart` | KV cache `List<Float32List>` → `List<OrtValue>` zero-copy, Dart matmul 제거 → ONNX logits 복원, OrtValue 명시적 release |
+| `cosyvoice_test_app/lib/pipeline/flow_inference.dart` | 정적 OrtValue 사전 할당, CFG skip, 메모리 누수 수정 |
+| `cosyvoice_test_app/lib/pipeline/constants.dart` | `cfgSkipThreshold = 0.3` 추가 |
 
 ### 22.9 최적화 요약
 
-| 단계 | 변경 | LLM RTF | 누적 개선 |
-|------|------|---------|-----------|
-| 초기 (debug) | — | ~3.2 | 기준선 |
-| Release 빌드 | AOT 컴파일 | 3.06 | −4% |
-| KV cache zero-copy | OrtValue 포인터 직접 전달 | 0.465 | **−85%** |
-| ONNX logits 복원 | Dart matmul → ONNX MatMul | **0.378** | **−88%** |
+| 단계 | 변경 | LLM RTF | Flow RTF | Total RTF |
+|------|------|---------|----------|-----------|
+| 초기 (debug) | — | ~3.2 | ~0.4 | ~3.6 |
+| Release 빌드 | AOT 컴파일 | 3.06 | — | — |
+| KV cache zero-copy | OrtValue 포인터 직접 전달 | 0.465 | — | 1.047 |
+| ONNX logits 복원 | Dart matmul → ONNX MatMul | **0.378** | — | ~0.96 |
+| Flow OrtValue 사전 할당 | mask/mu/spks/cond/zeros 1회 생성 | — | 0.357→개선 | — |
+| **CFG skip (t<0.3)** | 마지막 스텝 unconditional 스킵 | — | **0.262** | **~0.86** |
 
-**최종: LLM RTF 0.378, Python(0.423) 대비 11% 빠름. Total RTF ~0.96으로 실시간 돌파.**
+**최종: LLM RTF 0.378, Flow RTF 0.262, Total RTF ~0.86. Python(0.989) 대비 13% 빠름.**
 
-### 22.10 다음 단계
+### 22.10 [2026-05-30] Flow/DiT 최적화 — RTF 0.357→0.262
 
-1. **Flow 최적화** — DiT ODE 루프에서 OrtValue 재사용 검토 (0.357 → ?)
-2. **모바일(Android) 빌드 및 RTF 측정** — 실제 ARM 성능 확인
+#### 22.10.1 정적 OrtValue 사전 할당
+
+LLM과 동일한 안티패턴 발견: ODE 루프에서 mask, mu, spks, cond 등 7개 정적 입력을 매 스텝마다 새 OrtValue로 생성 (총 36회 불필요 할당).
+
+**해결**: 루프 진입 전 1회만 생성, 모든 스텝에서 포인터 재사용.
+- 할당 56회 → 12회 (78% 감소)
+- 56개 OrtValue 메모리 누수 수정 (release() 0개 → 전부 추가)
+
+#### 22.10.2 CFG Timestep Skip
+
+Flow Matching에서 timestep t의 의미:
+- t=1.0 (순수 노이즈): 전체 구조 결정, CFG 매우 중요
+- t=0.0 (거의 완성): 디테일 정제만, CFG 영향 미미
+
+cosine schedule 4스텝에서 마지막 스텝(t≈0.25→0.00)의 unconditional DiT 호출을 스킵:
+
+```
+step 1: t≈1.00→0.75  ✅ CFG (conditional + unconditional)
+step 2: t≈0.75→0.50  ✅ CFG
+step 3: t≈0.50→0.25  ✅ CFG
+step 4: t≈0.25→0.00  ❌ conditional only (unconditional skip)
+```
+
+DiT 호출: 8회 → 7회 (12.5% 절감)
+
+**`cfgSkipThreshold` 상수로 제어 (0.0 = 항상 CFG, 0.3 = 마지막 스텝 스킵, 0.5 = 실험 가능)**
+
+#### 22.10.3 성능 결과
+
+| 항목 | 변경 전 | 변경 후 | 개선 |
+|------|---------|---------|------|
+| Flow RTF | 0.357 | **0.262** | **−27%** |
+| DiT 호출 | 8회 | 7회 | −12.5% |
+| 총 RTF (추정) | ~0.96 | **~0.86** | **−10%** |
+
+### 22.11 병목 분포 (최종)
+
+```
+LLM    ████████████████░░░░░  ~44%  (0.378)
+Flow   ██████████░░░░░░░░░░░  ~30%  (0.262)
+HIFT   ██████░░░░░░░░░░░░░░░  ~20%  (0.171)
+Prepr  █░░░░░░░░░░░░░░░░░░░░   ~5%  (0.041)
+```
+
+### 22.12 다음 단계
+
+1. **모바일(Android) 빌드 및 RTF 측정** — 실제 ARM 성능 확인
+2. **cfgSkipThreshold 실험** — 0.5까지 올려가며 음질/RTF 트레이드오프 측정
 3. **FP16 DiT 모바일 테스트** — ARM64 FP16 가속 효과 확인
