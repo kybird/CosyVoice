@@ -214,6 +214,14 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "2.0.34"
+  flutter_recorder:
+    dependency: "direct main"
+    description:
+      name: flutter_recorder
+      sha256: e16a7d945c65e0f77a3448850e4fb3204df84240f1e8b383799838925456ec24
+      url: "https://pub.dev"
+    source: hosted
+    version: "1.1.5"
   flutter_test:
     dependency: "direct dev"
     description: flutter

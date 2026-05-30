@@ -2,6 +2,9 @@ import 'dart:io';
 import 'package:audioplayers/audioplayers.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_recorder/flutter_recorder.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'pipeline/constants.dart';
 import 'pipeline/cosyvoice_pipeline.dart';
 
@@ -52,6 +55,8 @@ class _CosyVoiceHomePageState extends State<CosyVoiceHomePage> {
   double _audioDuration = 0.0;
   bool _isGenerating = false;
   bool _isPlaying = false;
+  bool _isRecording = false;
+  String _recordingPath = '';
   Map<String, bool> _modelStatus = {};
 
   @override
@@ -122,6 +127,40 @@ class _CosyVoiceHomePageState extends State<CosyVoiceHomePage> {
       setState(() {
         _refWavPath = result.files.single.path!;
         _status = 'Reference: ${result.files.single.name}';
+      });
+    }
+  }
+
+  Future<void> _toggleRecording() async {
+    if (_isRecording) {
+      // Stop recording
+      Recorder.instance.stopRecording();
+      setState(() {
+        _isRecording = false;
+        if (_recordingPath.isNotEmpty) {
+          _refWavPath = _recordingPath;
+          _status = 'Recorded: ${_recordingPath.split(Platform.pathSeparator).last}';
+        } else {
+          _status = 'Recording stopped (no file)';
+        }
+      });
+    } else {
+      // Request permission on Android/iOS
+      if (Platform.isAndroid || Platform.isIOS) {
+        final status = await Permission.microphone.request();
+        if (!status.isGranted) {
+          setState(() => _status = 'Microphone permission denied');
+          return;
+        }
+      }
+      final tempDir = await getTemporaryDirectory();
+      final path =
+          '${tempDir.path}${Platform.pathSeparator}ref_recorded_${DateTime.now().millisecondsSinceEpoch}.wav';
+      _recordingPath = path;
+      Recorder.instance.startRecording(completeFilePath: path);
+      setState(() {
+        _isRecording = true;
+        _status = 'Recording... tap again to stop';
       });
     }
   }
@@ -257,6 +296,15 @@ class _CosyVoiceHomePageState extends State<CosyVoiceHomePage> {
                 OutlinedButton(
                   onPressed: _pickRefWav,
                   child: const Text('Browse'),
+                ),
+                const SizedBox(width: 8),
+                FilledButton.icon(
+                  onPressed: _isGenerating ? null : _toggleRecording,
+                  style: FilledButton.styleFrom(
+                    backgroundColor: _isRecording ? Colors.red : null,
+                  ),
+                  icon: Icon(_isRecording ? Icons.stop : Icons.mic),
+                  label: Text(_isRecording ? 'Stop' : 'Record'),
                 ),
               ],
             ),
