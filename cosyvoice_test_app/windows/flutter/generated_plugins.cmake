@@ -11,6 +11,7 @@ list(APPEND FLUTTER_FFI_PLUGIN_LIST
   flutter_recorder
   jni
   onnxruntime_v2
+  sherpa_onnx_windows
 )
 
 set(PLUGIN_BUNDLED_LIBRARIES)

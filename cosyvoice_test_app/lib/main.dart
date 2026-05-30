@@ -2,9 +2,11 @@ import 'dart:io';
 import 'package:audioplayers/audioplayers.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_recorder/flutter_recorder.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:sherpa_onnx/sherpa_onnx.dart' as sherpa_onnx;
 import 'pipeline/constants.dart';
 import 'pipeline/cosyvoice_pipeline.dart';
 
@@ -59,11 +61,52 @@ class _CosyVoiceHomePageState extends State<CosyVoiceHomePage> {
   bool _isRecording = false;
   String _recordingPath = '';
   Map<String, bool> _modelStatus = {};
+  sherpa_onnx.OfflineRecognizer? _recognizer;
 
   @override
   void initState() {
     super.initState();
     _initRecorder();
+    _initSherpa();
+  }
+
+  Future<void> _initSherpa() async {
+    try {
+      // Initialize native bindings first
+      sherpa_onnx.initBindings();
+      // Copy model assets to a local directory (sherpa_onnx needs file paths)
+      final assetDir = 'assets/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17';
+      final appDir = await getApplicationSupportDirectory();
+      final localModelDir = '${appDir.path}/sherpa-onnx-sense-voice';
+      await Directory(localModelDir).create(recursive: true);
+
+      // Copy assets if not already present
+      for (final name in ['model.int8.onnx', 'tokens.txt']) {
+        final localPath = '$localModelDir/$name';
+        if (!File(localPath).existsSync()) {
+          final data = await rootBundle.load('$assetDir/$name');
+          await File(localPath).writeAsBytes(
+            data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes),
+          );
+        }
+      }
+
+      final modelConfig = sherpa_onnx.OfflineModelConfig(
+        senseVoice: sherpa_onnx.OfflineSenseVoiceModelConfig(
+          model: '$localModelDir/model.int8.onnx',
+          language: 'auto',
+          useInverseTextNormalization: true,
+        ),
+        tokens: '$localModelDir/tokens.txt',
+        modelType: 'senseVoice',
+        numThreads: 2,
+      );
+      final config = sherpa_onnx.OfflineRecognizerConfig(model: modelConfig);
+      _recognizer = sherpa_onnx.OfflineRecognizer(config);
+      debugPrint('Sherpa ONNX STT initialized');
+    } catch (e) {
+      debugPrint('Sherpa init error: $e');
+    }
   }
 
   Future<void> _initRecorder() async {
@@ -84,6 +127,7 @@ class _CosyVoiceHomePageState extends State<CosyVoiceHomePage> {
     _promptController.dispose();
     _audioPlayer.dispose();
     _pipeline.dispose();
+    _recognizer?.free();
     Recorder.instance.deinit();
     super.dispose();
   }
@@ -145,10 +189,12 @@ class _CosyVoiceHomePageState extends State<CosyVoiceHomePage> {
       allowMultiple: false,
     );
     if (result != null && result.files.single.path != null) {
+      final path = result.files.single.path!;
       setState(() {
-        _refWavPath = result.files.single.path!;
-        _status = 'Reference: ${result.files.single.name}';
+        _refWavPath = path;
+        _status = 'Reference: ${result.files.single.name}. Transcribing...';
       });
+      _transcribeRecording(path);
     }
   }
 
@@ -195,31 +241,29 @@ class _CosyVoiceHomePageState extends State<CosyVoiceHomePage> {
   }
 
   Future<void> _transcribeRecording(String audioPath) async {
+    if (_recognizer == null) {
+      setState(() => _status = 'Recorded. STT not initialized.');
+      return;
+    }
     try {
-      // transcribe.py lives next to pubspec.yaml (project root)
-      final exePath = Platform.resolvedExecutable;
-      // In release mode, exe is at build/windows/x64/runner/Release/
-      // Project root is 4 levels up
-      final projectDir = File(exePath).parent.parent.parent.parent.parent.path;
-      final scriptPath = '$projectDir${Platform.pathSeparator}transcribe.py';
-
-      final result = await Process.run(
-        'python',
-        [scriptPath, audioPath, 'ko'],
-        runInShell: true,
+      final waveData = sherpa_onnx.readWave(audioPath);
+      final stream = _recognizer!.createStream();
+      stream.acceptWaveform(
+        samples: waveData.samples,
+        sampleRate: waveData.sampleRate,
       );
+      _recognizer!.decode(stream);
+      final text = _recognizer!.getResult(stream).text.trim();
+      stream.free();
 
-      final text = result.stdout.toString().trim();
-      if (result.exitCode == 0 && text.isNotEmpty) {
+      if (text.isNotEmpty) {
         setState(() {
           _promptController.text = text;
           _promptText = text;
           _status = 'Recorded & transcribed: "$text"';
         });
       } else {
-        final error = result.stderr.toString().trim();
-        debugPrint('STT stderr: $error');
-        setState(() => _status = 'Recorded. STT failed: ${error.split('\n').first}');
+        setState(() => _status = 'Recorded. Transcription empty.');
       }
     } catch (e) {
       debugPrint('Transcription error: $e');
