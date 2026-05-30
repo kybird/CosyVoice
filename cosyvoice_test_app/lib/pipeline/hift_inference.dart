@@ -49,6 +49,8 @@ class HiftInference {
 
     final outputs = _session.run(runOpts, inputs);
     final audio = flattenToFloat32(outputs[0]!.value);
+    (outputs[0] as OrtValueTensor).release();
+    (inputs['speech_feat'] as OrtValueTensor).release();
     return audio;
   }
 

@@ -28,12 +28,15 @@ class FlowInference {
     }
     _flowPrepSession = await _loadSession(prepPath, opts);
 
-    // DiT estimator — prefer INT8 FFN
+    // DiT estimator — prefer INT8 FFN (FP16 dit fails on ARM64 CPU EP)
     var ditPath = '$onnxDir/dit_estimator_int8_ffn.onnx';
     if (!await File(ditPath).exists()) {
-      ditPath = '$onnxDir/dit_estimator_mobile.onnx';
+      ditPath = '$onnxDir/dit_estimator_fp16.onnx';
       if (!await File(ditPath).exists()) {
-        ditPath = '$onnxDir/dit_estimator.onnx';
+        ditPath = '$onnxDir/dit_estimator_mobile.onnx';
+        if (!await File(ditPath).exists()) {
+          ditPath = '$onnxDir/dit_estimator.onnx';
+        }
       }
     }
     // DiT is the main bottleneck — use more threads

@@ -10,8 +10,9 @@ import 'preprocessing.dart';
 /// Embeddings and logits via llm_embed.onnx.
 class LlmInference {
   late OrtSession _embedSession;
-  late OrtSession _initialSession;
+  OrtSession? _initialSession; // lazy loaded, released after prefill
   late OrtSession _decodeSession;
+  String? _onnxDir; // stored for lazy initial load
 
   // Dummy inputs for llm_embed.onnx (unused outputs computed but discarded)
   final Int64List _dummyTokenIds = Int64List.fromList([0]);
@@ -24,20 +25,25 @@ class LlmInference {
   /// Load LLM ONNX sessions.
   /// [onnxDir] is the directory containing llm_*.onnx files.
   Future<void> load(String onnxDir) async {
+    _onnxDir = onnxDir;
     final opts = OrtSessionOptions()
       ..setSessionGraphOptimizationLevel(GraphOptimizationLevel.ortEnableAll)
       ..setIntraOpNumThreads(4)
       ..setInterOpNumThreads(1);
 
-    // Load llm_embed.onnx (embed_tokens + speech_embedding + llm_decoder)
-    _embedSession = await _loadSession('$onnxDir/llm_embed.onnx', opts);
-
-    // Load llm_initial.onnx (prefill) — prefer FP32 for quality
-    var initialPath = '$onnxDir/llm_initial.onnx';
-    if (!await File(initialPath).exists()) {
-      initialPath = '$onnxDir/llm_initial_int8.onnx';
+    // Load llm_embed.onnx — prefer FP16 > INT4 > FP32
+    var embedPath = '$onnxDir/llm_embed_fp16_auto.onnx';
+    if (!await File(embedPath).exists()) {
+      embedPath = '$onnxDir/llm_embed_int4_gather.onnx';
+      if (!await File(embedPath).exists()) {
+        embedPath = '$onnxDir/llm_embed.onnx';
+      }
     }
-    _initialSession = await _loadSession(initialPath, opts);
+    pLog('Loading embed: $embedPath', tag: 'LLM');
+    _embedSession = await _loadSession(embedPath, opts);
+
+    // NOTE: initial session NOT loaded here — loaded lazily in run() to save memory.
+    // FP32 initial is 1366MB, only needed for 1 prefill call.
 
     // Load llm_decode_int8.onnx (decode step)
     var decodePath = '$onnxDir/llm_decode_int8.onnx';
@@ -183,8 +189,21 @@ class LlmInference {
       attentionMask[i] = 1;
     }
 
-    // ── Prefill via llm_initial.onnx ──
+    // ── Prefill via llm_initial.onnx (lazy load) ──
     pLog('[LLM] Building input: sos(1) + text(${allTextTokens.length}) + taskid(1) + speech(${speechTokens.length}) = seqLen=$seqLen', tag: 'LLM');
+    
+    // Load initial session on demand (FP32 preferred for quality, ~1366MB)
+    final initOpts = OrtSessionOptions()
+      ..setSessionGraphOptimizationLevel(GraphOptimizationLevel.ortEnableAll)
+      ..setIntraOpNumThreads(4)
+      ..setInterOpNumThreads(1);
+    var initialPath = '$_onnxDir/llm_initial.onnx';
+    if (!await File(initialPath).exists()) {
+      initialPath = '$_onnxDir/llm_initial_int8.onnx';
+    }
+    pLog('[LLM] Loading initial (lazy): $initialPath', tag: 'LLM');
+    final initialSession = await _loadSession(initialPath, initOpts);
+    
     final runOpts = OrtRunOptions();
     final initInputs = {
       'inputs_embeds': OrtValueTensor.createTensorWithDataList(
@@ -193,7 +212,11 @@ class LlmInference {
           attentionMask, [1, seqLen]),
     };
 
-    final initialOutputs = _initialSession.run(runOpts, initInputs);
+    final initialOutputs = initialSession.run(runOpts, initInputs);
+    
+    // Release initial session immediately after prefill to free ~1366MB
+    pLog('[LLM] Releasing initial session after prefill', tag: 'LLM');
+    await initialSession.release();
     // initialOutputs[0] = hidden_state (1, seq_len, 896)
     // initialOutputs[1..48] = KV cache (past_key_0, past_value_0, ..., past_key_23, past_value_23)
     final hiddenState = flattenToFloat32(initialOutputs[0]!.value);
@@ -342,7 +365,10 @@ class LlmInference {
   /// Release all sessions.
   Future<void> dispose() async {
     await _embedSession.release();
-    await _initialSession.release();
+    // _initialSession is already released after prefill in run()
+    if (_initialSession != null) {
+      await _initialSession!.release();
+    }
     await _decodeSession.release();
     _isLoaded = false;
   }

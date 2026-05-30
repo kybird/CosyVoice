@@ -86,7 +86,8 @@ class CosyVoicePipeline {
           File('$modelDirPretrained/speech_tokenizer_v3.onnx').existsSync(),
       'campplus.onnx':
           File('$modelDirPretrained/campplus.onnx').existsSync(),
-      'llm_embed.onnx': File('$onnxDir/llm_embed.onnx').existsSync(),
+      'llm_embed.onnx': File('$onnxDir/llm_embed_int4_gather.onnx').existsSync() ||
+          File('$onnxDir/llm_embed.onnx').existsSync(),
       'llm_initial.onnx': File('$onnxDir/llm_initial.onnx').existsSync() ||
           File('$onnxDir/llm_initial_int8.onnx').existsSync(),
       'llm_decode_int8.onnx':
@@ -160,6 +161,10 @@ class CosyVoicePipeline {
     pLog('  speaker_embedding: ${preprocData.speakerEmbedding.length} values');
     pLog('  prompt_speech_feat: ${preprocData.promptSpeechFeat.length} values, shape=${preprocData.promptFeatShape}, featLen=${preprocData.promptFeatLen}');
 
+    // Release preprocessing sessions to free ~970MB (data already extracted into preprocData)
+    pLog('  Releasing preprocessing sessions...');
+    await _preprocessor.dispose();
+
     // ── Stage 2: LLM Inference ──
     pLog('═══ STAGE 2: LLM INFERENCE ═══');
     sw.reset();
@@ -172,6 +177,10 @@ class CosyVoicePipeline {
     if (speechTokens.isEmpty) {
       throw Exception('LLM produced no speech tokens');
     }
+
+    // Release LLM sessions to free memory for Flow (~803MB freed)
+    pLog('  Releasing LLM sessions...');
+    await _llm.dispose();
 
     // ── Stage 3: Flow/DiT Inference ──
     pLog('═══ STAGE 3: FLOW/DIT ═══');
@@ -188,6 +197,10 @@ class CosyVoicePipeline {
     sw.stop();
     timings['flow'] = sw.elapsedMilliseconds / 1000.0;
 
+    // Release Flow sessions to free memory for HiFT
+    pLog('  Releasing Flow sessions...');
+    await _flow.dispose();
+
     // Determine mel length (output is (1, 80, T_mel) flat)
     final melLen = melOutput.length ~/ melDim;
     pLog('  mel_output: ${melOutput.length} values, melLen=$melLen frames');
@@ -202,7 +215,7 @@ class CosyVoicePipeline {
     pLog('  audio: ${audio.length} samples, duration=${(audio.length / sampleRate).toStringAsFixed(3)}s');
 
     // ── Stage 5: Save Output ──
-    // Normalize audio to prevent clipping
+    // Normalize audio: scale to [-0.95, 0.95] range
     double maxAbs = 0.0;
     for (int i = 0; i < audio.length; i++) {
       final abs = audio[i].abs();
@@ -210,9 +223,11 @@ class CosyVoicePipeline {
     }
     pLog('  max_amplitude: $maxAbs');
     final normalizedAudio = Float32List(audio.length);
-    final scale = maxAbs > 0.95 ? 0.95 / maxAbs : 1.0;
-    for (int i = 0; i < audio.length; i++) {
-      normalizedAudio[i] = audio[i] * scale;
+    if (maxAbs > 1e-6) {
+      final scale = 0.95 / maxAbs;
+      for (int i = 0; i < audio.length; i++) {
+        normalizedAudio[i] = audio[i] * scale;
+      }
     }
 
     final outputDir = await getOutputDir();
