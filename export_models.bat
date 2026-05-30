@@ -14,6 +14,7 @@ REM    Common:     llm_initial_int8.onnx, llm_decode_int8.onnx,
 REM                llm_embed.onnx, flow_prep_mobile.onnx, hift.onnx
 REM    x86:        dit_estimator_int8_ffn.onnx  (FFN INT8, ~1002MB)
 REM    Mobile:     dit_estimator_fp16.onnx      (FP16, ~634MB, ARM64 only)
+REM  Also downloads: sherpa-onnx STT model for Flutter app (~228MB)
 REM
 REM ============================================================
 
@@ -39,7 +40,7 @@ echo.
 if not exist "%ONNX_DIR%" mkdir "%ONNX_DIR%"
 
 REM ── Step 1: Export LLM (Qwen2) ──────────────────────────────
-echo [1/6] Exporting LLM (Qwen2) to ONNX ...
+echo [1/8] Exporting LLM (Qwen2) to ONNX ...
 echo       -^> llm_initial.onnx, llm_decode.onnx
 %PYTHON% "%EXPORT_DIR%\export_qwen2_onnx.py"
 if errorlevel 1 (
@@ -50,7 +51,7 @@ echo       Done.
 echo.
 
 REM ── Step 2: Export LLM Embedding ────────────────────────────
-echo [2/6] Exporting LLM embedding + decoder ...
+echo [2/8] Exporting LLM embedding + decoder ...
 echo       -^> llm_embed.onnx
 %PYTHON% "%EXPORT_DIR%\export_llm_embed_onnx.py"
 if errorlevel 1 (
@@ -61,7 +62,7 @@ echo       Done.
 echo.
 
 REM ── Step 3: Export Flow Prep ────────────────────────────────
-echo [3/6] Exporting Flow prep ...
+echo [3/8] Exporting Flow prep ...
 echo       -^> flow_prep_mobile.onnx
 %PYTHON% "%EXPORT_DIR%\export_flow_prep_onnx.py"
 if errorlevel 1 (
@@ -72,7 +73,7 @@ echo       Done.
 echo.
 
 REM ── Step 4: Export DiT Estimator ───────────────────────────
-echo [4/6] Exporting DiT estimator (mobile variant) ...
+echo [4/8] Exporting DiT estimator (mobile variant) ...
 echo       -^> dit_estimator_mobile.onnx
 %PYTHON% "%EXPORT_DIR%\export_dit_mobile.py"
 if errorlevel 1 (
@@ -83,7 +84,7 @@ echo       Done.
 echo.
 
 REM ── Step 5: Export HiFT Vocoder ────────────────────────────
-echo [5/6] Exporting HiFT vocoder ...
+echo [5/8] Exporting HiFT vocoder ...
 echo       -^> hift.onnx
 %PYTHON% "%EXPORT_DIR%\export_hift_onnx.py"
 if errorlevel 1 (
@@ -94,7 +95,7 @@ echo       Done.
 echo.
 
 REM ── Step 6: Quantize ──────────────────────────────────────
-echo [6/6] Quantizing ...
+echo [6/8] Quantizing ...
 echo.
 
 echo   [6a] LLM INT8 quantization ...
@@ -113,8 +114,18 @@ echo        -^> dit_estimator_fp16.onnx
 echo.
 
 REM ── Step 7: Merge external data ─────────────────────────────
-echo [7/7] Merging .onnx.data into single .onnx files ...
+echo [7/8] Merging .onnx.data into single .onnx files ...
 %PYTHON% "%ROOT_DIR%merge_onnx_external_data.py"
+echo.
+
+REM ── Step 8: Download STT model for Flutter app ──────────────
+echo [8/8] Downloading sherpa-onnx STT model for Flutter app ...
+echo       -^> model.int8.onnx, tokens.txt (~228MB download)
+%PYTHON% "%ROOT_DIR%download_stt_model.py"
+if errorlevel 1 (
+    echo WARNING: STT model download failed - STT will not work in app
+    echo          TTS still works without it (manual prompt text entry)
+)
 echo.
 
 REM ── Summary ───────────────────────────────────────────────
@@ -128,6 +139,8 @@ dir /b "%ONNX_DIR%\*.onnx" 2>nul | findstr /i ".onnx"
 echo.
 echo  x86 CPU:    dit_estimator_int8_ffn.onnx  (FFN INT8)
 echo  Mobile:     dit_estimator_fp16.onnx      (FP16, ARM64 native)
+echo.
+echo  STT model:  cosyvoice_test_app/assets/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17/
 echo ============================================================
 
 goto :end
