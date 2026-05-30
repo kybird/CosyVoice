@@ -43,6 +43,7 @@ class _CosyVoiceHomePageState extends State<CosyVoiceHomePage> {
   final CosyVoicePipeline _pipeline = CosyVoicePipeline();
   final TextEditingController _textController =
       TextEditingController(text: defaultTtsText);
+  final TextEditingController _promptController = TextEditingController();
   final AudioPlayer _audioPlayer = AudioPlayer();
 
   String _modelDir = '';
@@ -60,10 +61,29 @@ class _CosyVoiceHomePageState extends State<CosyVoiceHomePage> {
   Map<String, bool> _modelStatus = {};
 
   @override
+  void initState() {
+    super.initState();
+    _initRecorder();
+  }
+
+  Future<void> _initRecorder() async {
+    try {
+      await Recorder.instance.init(
+        sampleRate: 24000,
+        channels: RecorderChannels.mono,
+      );
+    } catch (e) {
+      debugPrint('Recorder init error: $e');
+    }
+  }
+
+  @override
   void dispose() {
     _textController.dispose();
+    _promptController.dispose();
     _audioPlayer.dispose();
     _pipeline.dispose();
+    Recorder.instance.deinit();
     super.dispose();
   }
 
@@ -139,11 +159,15 @@ class _CosyVoiceHomePageState extends State<CosyVoiceHomePage> {
         _isRecording = false;
         if (_recordingPath.isNotEmpty) {
           _refWavPath = _recordingPath;
-          _status = 'Recorded: ${_recordingPath.split(Platform.pathSeparator).last}';
+          _status = 'Recorded. Transcribing...';
         } else {
           _status = 'Recording stopped (no file)';
         }
       });
+      // Auto-transcribe and fill prompt text
+      if (_recordingPath.isNotEmpty) {
+        _transcribeRecording(_recordingPath);
+      }
     } else {
       // Request permission on Android/iOS
       if (Platform.isAndroid || Platform.isIOS) {
@@ -162,6 +186,39 @@ class _CosyVoiceHomePageState extends State<CosyVoiceHomePage> {
         _isRecording = true;
         _status = 'Recording... tap again to stop';
       });
+    }
+  }
+
+  Future<void> _transcribeRecording(String audioPath) async {
+    try {
+      // transcribe.py lives next to pubspec.yaml (project root)
+      final exePath = Platform.resolvedExecutable;
+      // In release mode, exe is at build/windows/x64/runner/Release/
+      // Project root is 4 levels up
+      final projectDir = File(exePath).parent.parent.parent.parent.parent.path;
+      final scriptPath = '$projectDir${Platform.pathSeparator}transcribe.py';
+
+      final result = await Process.run(
+        'python',
+        [scriptPath, audioPath, 'ko'],
+        runInShell: true,
+      );
+
+      final text = result.stdout.toString().trim();
+      if (result.exitCode == 0 && text.isNotEmpty) {
+        setState(() {
+          _promptController.text = text;
+          _promptText = text;
+          _status = 'Recorded & transcribed: "$text"';
+        });
+      } else {
+        final error = result.stderr.toString().trim();
+        debugPrint('STT stderr: $error');
+        setState(() => _status = 'Recorded. STT failed: ${error.split('\n').first}');
+      }
+    } catch (e) {
+      debugPrint('Transcription error: $e');
+      setState(() => _status = 'Recorded. STT failed: $e');
     }
   }
 
@@ -310,8 +367,9 @@ class _CosyVoiceHomePageState extends State<CosyVoiceHomePage> {
             ),
             const SizedBox(height: 8),
             TextField(
+              controller: _promptController,
               decoration: const InputDecoration(
-                labelText: 'Prompt Text (optional, auto-detected from filename)',
+                labelText: 'Prompt Text (auto-filled from recording, editable)',
                 border: OutlineInputBorder(),
                 isDense: true,
               ),
