@@ -56,7 +56,7 @@ const Map<String, String> refPromptMap = {
 };
 
 // Default TTS text
-const String defaultTtsText = '안녕하세요, 반갑습니다.';
+const String  defaultTtsText  = '옛날 옛적에 어느 깊은 산골 마을에 한 농부가 살고 있었어요. 어느 날 농부가 산에 나무를 하러 갔다가 도끼를 연못에 빠뜨리고 말았습니다.';
 
 // Default Android model directory
 const String defaultModelDir = '/storage/emulated/0/CosyVoice';
