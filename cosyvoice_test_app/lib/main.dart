@@ -164,6 +164,17 @@ class _CosyVoiceHomePageState extends State<CosyVoiceHomePage> {
   }
 
   Future<void> _loadModels() async {
+    // Request storage permission on Android
+    if (Platform.isAndroid) {
+      var status = await Permission.manageExternalStorage.status;
+      if (!status.isGranted) {
+        status = await Permission.manageExternalStorage.request();
+        if (!status.isGranted) {
+          setState(() => _status = 'Storage permission required. Please grant in Settings.');
+          return;
+        }
+      }
+    }
     if (_modelDir.isEmpty) {
       // Try default Android path
       if (await Directory(defaultModelDir).exists()) {

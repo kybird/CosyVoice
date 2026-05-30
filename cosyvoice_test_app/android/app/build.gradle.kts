@@ -37,6 +37,13 @@ android {
             signingConfig = signingConfigs.getByName("debug")
         }
     }
+
+    // sherpa_onnx and onnxruntime_v2 both ship libonnxruntime.so
+    packaging {
+        jniLibs {
+            pickFirsts += setOf("**/libonnxruntime.so")
+        }
+    }
 }
 
 flutter {
