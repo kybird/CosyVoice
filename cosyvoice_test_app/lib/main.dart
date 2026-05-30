@@ -72,6 +72,7 @@ class _CosyVoiceHomePageState extends State<CosyVoiceHomePage> {
         sampleRate: 24000,
         channels: RecorderChannels.mono,
       );
+      Recorder.instance.start();
     } catch (e) {
       debugPrint('Recorder init error: $e');
     }
@@ -176,6 +177,10 @@ class _CosyVoiceHomePageState extends State<CosyVoiceHomePage> {
           setState(() => _status = 'Microphone permission denied');
           return;
         }
+      }
+      // Ensure device is started before recording
+      if (!Recorder.instance.isDeviceStarted()) {
+        Recorder.instance.start();
       }
       final tempDir = await getTemporaryDirectory();
       final path =
