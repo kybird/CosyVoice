@@ -1540,3 +1540,459 @@ Prepr  █░░░░░░░░░░░░░░░░░░░░   ~5%  (0
 1. **모바일(Android) 빌드 및 RTF 측정** — 실제 ARM 성능 확인
 2. **cfgSkipThreshold 실험** — 0.5까지 올려가며 음질/RTF 트레이드오프 측정
 3. **FP16 DiT 모바일 테스트** — ARM64 FP16 가속 효과 확인
+
+---
+
+## 23. [2026-05-30] 모바일 메모리 최적화 — INT4 GatherBlockQuantized + LLM 첫 완주
+
+### 23.1 모바일 OOM 실측
+
+**기기**: Redmi 22041216UC (ARM64, 7.5GB RAM, 가용 ~2.5GB)
+
+APK + 모델 푸시 후 adb logcat으로 실시간 모니터링:
+
+```
+21:58 LLM 시작 (llm_initial prefill)
+22:01 LLM Step 1200/1240
+22:01 lowmemorykiller에 의해 앱 사망 (PSS 4.55→4.62GB)
+```
+
+| 메트릭 | 측정값 |
+|--------|--------|
+| PSS (LLM만) | 4.55→4.62GB |
+| CPU | 170% |
+| 스텝 소요 | 100→200ms (점진 증가) |
+| 추정 총 LLM 시간 | ~4분 (1240 × 200ms) |
+| 사망 원인 | lowmemorykiller (LLM 3세션 상주 + KV 캐시 누적) |
+
+**메모리 분석**: LLM embed+initial+decode 세션이 동시 상주. 특히 `llm_embed.onnx`의 `embed_tokens` Gather 룩업테이블(151936×896 FP32 = 517MB)이 절반 차지.
+
+### 23.2 FP16 llm_embed 변환
+
+`llm_embed.onnx`의 FP32 가중치를 FP16으로 변환 (Cast 노드로 자동 FP32↔FP16 변환):
+
+| 항목 | FP32 | FP16 |
+|------|------|------|
+| 파일 크기 | 565.5 MB | 282.8 MB |
+| text_emb max_diff | 기준 | 0.000030 |
+| logits max_diff | 기준 | 0.001005 |
+| cos_sim | 1.0 | ≈1.0 |
+
+- **스크립트**: `export/convert_embed_fp16.py`
+- **출력**: `onnx_models/llm_embed_fp16_auto.onnx`
+
+### 23.3 INT4 GatherBlockQuantized 변환
+
+**GatherBlockQuantized** (com.microsoft domain, contrib op)를 이용해 `embed_tokens` Gather 노드를 INT4 블록 양자화로 교체.
+
+#### 연산자 스펙
+
+| 항목 | 값 |
+|------|-----|
+| Domain | `com.microsoft` (contrib op) |
+| 지원 EP | CPU EP (ARM64 포함), CUDA EP, WebGPU EP |
+| 지원 bits | 2, 4, 8 |
+| block_size | 16 이상, 2의 거듭제곱 (기본 128) |
+| 디양자화 | `output = (quant_val - zero_point) × scale` |
+| CPU EP 구현 | 순수 C++ 스칼라 (SIMD 없음, 아키텍처 무관) |
+
+#### embed_tokens [151936, 896] INT4 양자화
+
+대칭 양자화 (zero_point=8 고정, zero_points 입력 생략):
+
+| 항목 | Shape | 크기 |
+|------|-------|------|
+| packed data (uint8) | [151936, 448] | ~62 MB |
+| scales (float32) | [151936, 7] | ~4.2 MB |
+| **합계** | | **~66 MB** (vs 517MB FP32 = 87% 절감) |
+
+#### Python 품질 검증
+
+| 출력 | Max Diff | Mean Diff | Cos Sim |
+|------|----------|-----------|---------|
+| **text_emb** | 0.006415 | 0.001893 | **0.9930** |
+| speech_emb | 0.000000 | 0.000000 | 1.0000 |
+| logits | 0.000000 | 0.000000 | 1.0000 |
+
+- **스크립트**: `export/convert_embed_int4_gather.py`
+- **출력**: `onnx_models/llm_embed_int4_gather.onnx` — **115.2 MB** (565.5MB에서 80% 절감)
+
+#### 파일 크기 비교
+
+| 모델 | 크기 | 비율 |
+|------|------|------|
+| `llm_embed.onnx` (FP32 원본) | 565.5 MB | 100% |
+| `llm_embed_fp16_auto.onnx` (FP16) | 282.8 MB | 50% |
+| **`llm_embed_int4_gather.onnx` (INT4)** | **115.2 MB** | **20%** |
+
+### 23.4 sherpa-onnx 조사
+
+sherpa-onnx가 GatherBlockQuantized contrib op를 지원하는지 조사:
+
+| 항목 | 결과 |
+|------|------|
+| GatherBlockQuantized 언급 | **0건** (리포 전체 검색) |
+| ORT 버전 (Android ARM64) | 1.24.3 (csukuangfj/onnxruntime-libs 커스텀 빌드) |
+| Flutter 지원 | 예제만 (tts, streaming_asr) |
+| **핵심 문제** | **고수준 API만 제공** — 임의 ONNX 모델 로드 불가 |
+
+→ 우리 용도(커스텀 ONNX 모델 + contrib op)에는 부적합. `onnxruntime_v2` 패키지 계속 사용.
+
+### 23.5 onnxruntime_v2 contrib op 지원 확인
+
+기기 APK 내 `libonnxruntime.so` (25.8MB, ARM64)에서 GatherBlockQuantized 심볼 검색:
+
+```bash
+adb shell "grep -c GatherBlockQuantized /data/local/tmp/libonnxruntime.so"
+# 결과: 4 (심볼 존재 확인)
+```
+
+→ **onnxruntime_v2의 ORT 빌드에 contrib ops 포함됨.**
+
+### 23.6 기기 테스트 — LLM 첫 완주 ✅
+
+#### 변경 사항
+
+| 파일 | 변경 |
+|------|------|
+| `llm_inference.dart` | `llm_embed_int4_gather.onnx` 우선 로드, 없으면 `llm_embed.onnx` 폴백 |
+| `cosyvoice_pipeline.dart` | 모델 체크에 INT4 버전 포함 |
+| 기기 `/storage/emulated/0/CosyVoice/onnx_models/` | `llm_embed_int4_gather.onnx` 업로드 (115MB) |
+
+#### 타임라인
+
+```
+22:51:55 — [LLM] Loading embed: llm_embed_int4_gather.onnx ✅ 로드 성공
+22:52:33 — STAGE 1: PREPROCESSING
+22:52:38 — STAGE 2: LLM INFERENCE
+22:52:41 — First token: 0
+22:52:44 — Step 20/1240
+22:53:00 — Step 260/1240
+22:53:10 — Step 440/1240
+22:53:20 — Step 640/1240
+22:53:30 — Step 800/1240
+22:53:32 — Stop token 6562 at step 844 ✅ LLM 완주!
+22:53:32 — STAGE 3: FLOW/DIT
+22:53:32 — flow_prep output: shape=[1, 80, 1840] ✅
+           → dit_estimator_int8_ffn.onnx (900MB) 로드 시도...
+           → lowmemorykiller ❌ 앱 사망
+```
+
+#### 분석
+
+**LLM 스텝당 소요시간**: ~55ms/step (이전 FP32에서는 ~100-200ms/step)
+
+| 스텝 구간 | 소요 | 속도 |
+|-----------|------|------|
+| 0→120 | 9.2s | ~77ms/step |
+| 120→440 | 19.9s | ~62ms/step |
+| 440→844 | 22.1s | ~55ms/step |
+
+→ INT4 GatherBlockQuantized가 디양자화 오버헤드 없이 FP32보다 **빠름** (캐시 히트율 향상, 517MB→66MB 메모리 풋프린트 감소)
+
+#### LLM 세션 메모리 (INT4 embed)
+
+| 세션 | 크기 |
+|------|------|
+| embed (INT4) | ~115 MB |
+| initial (INT8) | ~344 MB |
+| decode (INT8) | ~344 MB |
+| **LLM 합계** | **~803 MB** + KV 캐시 |
+
+이전 FP32 embed에서 4.6GB PSS → INT4에서 LLM 완주 성공 (450MB 절감 효과).
+
+### 23.7 Flow 단계 OOM — 다음 최적화 타겟
+
+LLM 완료 후에도 3개 LLM 세션이 메모리에 상주한 채 dit_estimator (900MB) 로드 시도 → OOM.
+
+**해결 방안**:
+
+| 우선순위 | 방법 | 예상 효과 |
+|----------|------|-----------|
+| 1 | LLM 완료 후 embed/initial 세션 해제 | ~460MB 확보 |
+| 2 | dit_estimator 추가 양자화 (FP16 → 317MB) | ~583MB 추가 절감 |
+| 3 | Flow 완료 후 dit 해제 → hift 로드 | 순차적 로딩 |
+
+**목표**: 순차적 세션 로딩 + 해제로 7.5GB RAM에서 전체 파이프라인 완주.
+
+### 23.8 생성된 파일
+
+| 파일 | 크기 | 설명 |
+|------|------|------|
+| `onnx_models/llm_embed_int4_gather.onnx` | 115.2 MB | INT4 GatherBlockQuantized embed |
+| `onnx_models/llm_embed_fp16_auto.onnx` | 282.8 MB | FP16 embed (참고용) |
+| `export/convert_embed_int4_gather.py` | — | INT4 변환 + 품질 검증 스크립트 |
+
+### 23.9 핵심 성과
+
+| 마일스톤 | 상태 |
+|----------|------|
+| GatherBlockQuantized INT4 변환 | ✅ cos_sim 0.993 |
+| ARM64 CPU EP contrib op 지원 확인 | ✅ 심볼 존재 |
+| 모바일 INT4 모델 로드 성공 | ✅ 최초 |
+| **LLM 완주 (Step 844, stop token)** | **✅ 최초** |
+| Flow/DiT OOM | ❌ 다음 타겟 |
+
+### 23.10 순차적 세션 Release + LLM 1240 완주
+
+#### Stage 간 메모리 해제 로직 추가
+
+```dart
+// cosyvoice_pipeline.dart
+
+// Stage 1 완료 후: 전처리 세션 해제 (~970MB 확보)
+await _preprocessor.dispose();
+
+// Stage 2 완료 후: LLM 세션 해제 (~803MB 확보)
+await _llm.dispose();
+
+// Stage 3 완료 후: Flow 세션 해제
+await _flow.dispose();
+```
+
+#### 메모리 흐름 (순차적 로딩/해제)
+
+```
+[Init] 모든 모델 로드 (~3.0GB)
+  ↓
+[Stage 1] Preprocessing 실행
+  ↓ dispose() → ~970MB 해제
+[Stage 2] LLM 실행 (INT4 embed + INT8 initial + INT8 decode)
+  ↓ ~803MB 상주, 1240 steps
+  ↓ dispose() → ~803MB 해제
+[Stage 3] Flow/DiT 실행 (dit_estimator_int8_ffn ~900MB)
+  ↓
+  ↓ dispose() → ~900MB 해제
+[Stage 4] HiFT 실행 (~327MB)
+```
+
+#### 두 번째 LLM 완주 (Step 1240/1240)
+
+LLM 세션 release 추가 후 다시 테스트. 이번에는 1240 steps까지 완주 (stop token 없이 max_steps 도달):
+
+```
+23:21:09 Step 700/1240
+23:21:43 Step 1240/1240 ✅ 완주
+23:21:43 LLM Done: 1240 raw tokens
+23:21:43 Releasing LLM sessions...
+23:21:43 STAGE 3: FLOW/DIT
+23:21:44 flow_prep output: shape=[1, 80, 2624], totalMelLen=2624
+           → dit 실행 중 lowmemorykiller 사망 ❌
+```
+
+#### 분석: 1240 토큰 → mel 2624프레임
+
+이전(844 토큰)과 비교:
+
+| 항목 | 844 토큰 (첫 완주) | 1240 토큰 (두 번째) |
+|------|-------------------|-------------------|
+| speech tokens | 844 | 1240 |
+| totalMelLen | 1840 | 2624 |
+| newMelLen | 1696 | 2480 |
+| dit 입력 크기 | 작음 | **42% 큼** |
+| 중간 텐서 | — | proportionally larger |
+
+→ 1240 토큰은 max_steps 한계 도달. mel이 너무 길어져 dit 중간 텐서가 OOM 유발.
+
+#### FP16 dit_estimator 기기 테스트 → 실패
+
+`dit_estimator_fp16.onnx` (634MB)를 기기에서 로드 시도:
+
+```
+Type error: Type(Tensor(float16)) of output arg (/estimator/time_embed/Cast_output_0)
+of node (/estimator/time_embed/cast)
+does not match expected type(tensor(float))
+```
+
+→ **ARM64 CPU EP에서 FP16 Cast 노드 출력 타입 미지원.** FP16은 모바일에서도 사용 불가.
+
+#### dit_estimator_int8_ffn 유일한 옵션 (900MB)
+
+FP16이 불가하므로 dit_estimator_int8_ffn.onnx (900MB)가 유일한 dit 버전.
+
+### 23.11 전처리 세션 Release 추가 (3차 시도)
+
+#### 변경 내용
+
+| 파일 | 변경 |
+|------|------|
+| `cosyvoice_pipeline.dart` | Stage 1 완료 후 `_preprocessor.dispose()` 추가 (~970MB 조기 해제) |
+
+#### 예상 메모리 예산 (dit 실행 시점)
+
+| 상태 | 메모리 |
+|------|--------|
+| 전처리 해제 | ~970MB 확보 |
+| LLM 해제 | ~803MB 확보 |
+| dit 상주 | ~900MB |
+| HiFT 상주 | ~327MB |
+| **총 상주** | **~1227MB** (가용 ~2.5GB 내) |
+
+→ 빌드/배포 완료. 기기 테스트 대기 중.
+
+### 23.13 모바일 전체 파이프라인 완주 성공 ✅
+
+**2026-05-31 00:10~00:13 — Redmi 22041216UC (7.5GB RAM)**
+
+#### 타임라인
+
+```
+00:10:49 — STAGE 1: PREPROCESSING
+00:10:54 — Releasing preprocessing sessions... ✅ (~970MB 해제)
+00:10:55 — STAGE 2: LLM INFERENCE
+00:11:03 — First token
+00:11:55 — Step 1060/1240
+00:12:00 — Step 1240/1240 ✅ LLM 완주 (1240 tokens)
+00:12:00 — Releasing LLM sessions... ✅ (~803MB 해제)
+00:12:00 — STAGE 3: FLOW/DIT
+00:12:00 — flow_prep output: shape=[1, 80, 2642], totalMelLen=2642
+00:13:29 — Releasing Flow sessions... ✅
+00:13:29 — mel_output: 198400 values, melLen=2480 frames
+00:13:29 — STAGE 4: HIFT VOCODER
+00:13:52 — audio: 1,190,400 samples, duration=49.600s ✅
+```
+
+#### 성능
+
+| 컴포넌트 | 시간 | RTF |
+|----------|------|-----|
+| Preprocessing | 5.45s | 0.11 |
+| LLM | 65.03s | 1.31 |
+| Flow/DiT | 89.17s | 1.80 |
+| HiFT | 22.84s | 0.46 |
+| **Total** | **182.49s** | **3.57** |
+
+- **오디오**: 49.6초 (1,190,400 samples @ 24kHz)
+- **LLM 스텝 속도**: ~100ms/step (일정)
+- **RTF 3.57**: 실시간의 3.6배. 49.6초 오디오를 182초만에 생성.
+
+#### 메모리 관리 성공
+
+| 시점 | 해제 | 누적 해제 |
+|------|------|-----------|
+| Stage 1 완료 | 전처리 ~970MB | 970MB |
+| Stage 2 완료 | LLM ~803MB | 1,773MB |
+| Stage 3 완료 | Flow ~900MB | 2,673MB |
+
+순차적 dispose로 각 스테이지 메모리 피크를 가용 RAM(~2.5GB) 이내로 유지.
+
+### 23.12 모델 파일 요약 (모바일용)
+
+| 파일 | 크기 | 상태 |
+|------|------|------|
+| `llm_embed_int4_gather.onnx` | 115 MB | ✅ 모바일 사용 |
+| `llm_initial_int8.onnx` | 344 MB | ✅ Stage 2 후 해제 |
+| `llm_decode_int8.onnx` | 344 MB | ✅ Stage 2 후 해제 |
+| `dit_estimator_int8_ffn.onnx` | 900 MB | ✅ Stage 3 후 해제 |
+| `flow_prep.onnx` | 4 MB | 상주 |
+| `hift.onnx` | 327 MB | Stage 4 |
+| 전처리 모델 5종 | ~970 MB | ✅ Stage 1 후 해제 |
+
+### 23.14 음질 문제 해결 — FP32 Initial Lazy Load
+
+#### 문제: INT8 Initial 발음 품질 저하
+
+첫 모바일 완주(RTF 3.57)에서 음성이 "바보처럼 말한다"는 품질 문제 발생.
+
+| 원인 | 분석 |
+|------|------|
+| max_amplitude 0.0148 | dit 출력이 비정상적으로 작음 (정상 0.99) |
+| LLM 토큰 반복 | token 244만 1080번 반복 생성 |
+| 오디오 정규화 | 작은 값 증폭 안 함 (scale=1.0 when maxAbs < 0.95) |
+
+**오디오 정규화 수정**: `0.95 / maxAbs` 로 항상 스케일업.
+
+#### FP16 embed 테스트
+
+`llm_embed_fp16_auto.onnx` (283MB) 로드 성공. INT4 embed(115MB)보다 품질 약간 개선.
+
+| 항목 | INT4 embed | FP16 embed |
+|------|-----------|------------|
+| 크기 | 115 MB | 283 MB |
+| LLM stop step | 769 | 638 |
+| max_amplitude | 0.50 | 0.28 |
+| RTF | 3.18 | 3.08 |
+| 음질 | 약간 문제 | 약간 개선 |
+
+→ 여전히 "약간 문제있는 사람이 말하는 것 같음"
+
+#### 근본 원인: INT8 Initial (§20과 동일)
+
+데스크톱 §20에서 이미 확인: **INT8 initial이 KV cache 품질을 붕괴시켜 발음 문제 유발.** 모바일에서도 동일 현상.
+
+#### 해결: FP32 Initial Lazy Load
+
+FP32 initial (1366MB)를 init 시 로드하지 않고, prefill 직전에 lazy load → prefill 1회 실행 → 즉시 release.
+
+```dart
+// load(): embed + decode 만 로드 (initial 제외)
+// run(): prefill 직전 initial lazy load → prefill → 즉시 release
+
+final initialSession = await _loadSession(initialPath, initOpts);
+final initialOutputs = initialSession.run(runOpts, initInputs);
+await initialSession.release(); // 즉시 해제, ~1366MB 확보
+```
+
+**메모리 피크 분석:**
+- Init: preproc(970) + embed(283) + decode(344) + dit(900) + hift(327) = ~2824MB
+- Stage 2 prefill: + initial FP32(1366) = ~1636MB (preproc 이미 해제됨)
+- Stage 2 decode: initial 해제됨, embed(283) + decode(344) = 627MB
+- Stage 3: dit(900) = 900MB
+
+#### 최종 모바일 결과 (FP32 initial + FP16 embed)
+
+**기기: Redmi 22041216UC, MediaTek Dimensity 930 (MT6895), Cortex-A78+A55, 8코어, 7.5GB RAM**
+
+| 컴포넌트 | 시간 | RTF |
+|----------|------|-----|
+| Preprocessing | 4.76s | — |
+| LLM (FP32 initial + INT8 decode + FP16 embed) | 43.32s | 1.49 |
+| Flow/DiT (INT8 FFN) | 39.17s | 1.35 |
+| HiFT | 13.29s | 0.46 |
+| **Total** | **100.54s** | **3.29** |
+
+- **오디오**: 29.08초, 727 speech tokens
+- **max_amplitude**: 0.524 (정상 범위)
+- **발음 품질**: ✅ 정상 ("제대로 말한다")
+- **LLM decode 속도**: ~55ms/step
+
+#### 병목 분석
+
+```
+LLM decode  ████████████████████████████████████░  43s (43%) — 727 steps × 55ms
+Flow/DiT    ██████████████████████████████████░░░  39s (39%) — 8회 dit 호출
+HiFT        ██████████████░░░░░░░░░░░░░░░░░░░░░░░  13s (13%)
+Prefill     ███░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   3s (3%)
+Preproc     ████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   5s (5%)
+```
+
+- **decode 루프가 93%** (40s / 43s). 각 step: embed(1ms) + decode(50ms) + logits(4ms)
+- decode 50ms의 90%는 24-layer INT8 MatMul → **CPU 연산 한계**
+- Dart→C++ 포팅해도 ORT 추론 자체가 이미 C++이므로 **속도 차이 없음**
+
+#### 속도 개선 한계
+
+| 방법 | 예상 효과 | 상태 |
+|------|----------|------|
+| XNNPACK EP | +10~20% | 미시도 |
+| 쓰레드 튜닝 | 의미 없음 (1 이상이면 동일) | — |
+| FP16 dit | ARM64 CPU EP에서 Cast 에러 | ❌ 불가 |
+| NNAPI (APU) | partial execution, 불확실 | 미시도 |
+| C++ 포팅 | ORT 자체가 이미 C++ | ❌ 의미 없음 |
+| **하드웨어 교체** | **플래그십 Snapdragon RTF ~1.5~2.0 예상** | — |
+
+### 23.15 모바일 최종 모델 구성
+
+| 파일 | 크기 | 로딩 시점 | 해제 시점 |
+|------|------|----------|----------|
+| 전처리 5종 | ~970 MB | Init | Stage 1 후 |
+| llm_embed_fp16_auto.onnx | 283 MB | Init | Stage 2 후 |
+| llm_initial.onnx | 1366 MB | Prefill 직전 (lazy) | Prefill 직후 |
+| llm_decode_int8.onnx | 344 MB | Init | Stage 2 후 |
+| dit_estimator_int8_ffn.onnx | 900 MB | Init | Stage 3 후 |
+| flow_prep.onnx | 4 MB | Init | 상주 |
+| hift.onnx | 327 MB | Init | 상주 |
+
+**Init 피크**: ~2824MB (전처리 + embed + decode + dit + hift)
+**Prefill 피크**: ~1636MB (전처리 해제 후, embed + initial + decode)
+**모델 총 크기 (기기 저장소)**: ~4.2GB
