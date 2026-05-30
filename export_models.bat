@@ -112,6 +112,11 @@ echo        -^> dit_estimator_fp16.onnx
 %PYTHON% -c "import onnx; from onnxruntime.transformers.float16 import convert_float_to_float16; m=onnx.load(r'%ONNX_DIR%\dit_estimator_mobile.onnx'); fp16=convert_float_to_float16(m, keep_io_types=True, op_block_list=['Softmax','LayerNormalization','InstanceNormalization','Sigmoid','Tanh','Exp','Div','ReduceMean','Pow']); onnx.save(fp16, r'%ONNX_DIR%\dit_estimator_fp16.onnx'); import os; print(f'  FP16: {os.path.getsize(r\"%ONNX_DIR%\dit_estimator_fp16.onnx\")/1024**2:.1f} MB')"
 echo.
 
+REM ── Step 7: Merge external data ─────────────────────────────
+echo [7/7] Merging .onnx.data into single .onnx files ...
+%PYTHON% "%ROOT_DIR%merge_onnx_external_data.py"
+echo.
+
 REM ── Summary ───────────────────────────────────────────────
 echo ============================================================
 echo  Export Complete!
