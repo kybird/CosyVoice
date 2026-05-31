@@ -1996,3 +1996,229 @@ Preproc     ████░░░░░░░░░░░░░░░░░░�
 **Init 피크**: ~2824MB (전처리 + embed + decode + dit + hift)
 **Prefill 피크**: ~1636MB (전처리 해제 후, embed + initial + decode)
 **모델 총 크기 (기기 저장소)**: ~4.2GB
+
+---
+
+## 24. [2026-06-01] 한국어 TTS 모델 탐색 — MeloTTS → Qwen3-TTS ONNX
+
+### 24.1 배경
+
+CosyVoice3 ONNX 모바일 파이프라인은 RTF 3.29로 동작하지만, LLM 기반 아키텍처의 무거운 연산량(0.6B LLM + DiT + HiFT = ~4.2GB)이 모바일에서 한계. 더 가벼운 대안 모델 탐색.
+
+### 24.2 MeloTTS + OpenVoice 테스트
+
+#### 환경 설정
+
+| 항목 | 값 |
+|------|-----|
+| Conda env | `tts_test` (Python 3.13) |
+| MeloTTS | pip install (한국어 지원) |
+| OpenVoice v2 | git clone (톤 컨버팅) |
+| MeCab-ko | `C:\mecab\bin\mecab.exe` (v0.999, msvc 빌드) |
+| MeCab 사전 | `C:\mecab\share\mecab-ko-dic` |
+
+#### g2pkk 패치
+
+g2pkk의 `MeCabWrapper`가 eunjeon(mecab-python)을 요구하므로, MeCab CLI를 직접 호출하는 `MeCabSubprocess` 클래스로 교체:
+
+```python
+# C:\Users\kybir\AppData\Roaming\Python\Python313\site-packages\g2pkk\g2pkk.py
+class MeCabSubprocess:
+    def __init__(self):
+        self.mecab_path = r"C:\mecab\bin\mecab.exe"
+        self.rcpath = r"C:\mecab\share\mecab-ko-dic"
+
+    def morphs(self, text):
+        proc = subprocess.run(
+            [self.mecab_path, "-d", self.rcpath, "-O", "wakati"],
+            input=text, text=True, capture_output=True, encoding='utf-8'
+        )
+        return proc.stdout.strip().split()
+```
+
+#### 결과
+
+| 항목 | 결과 |
+|------|------|
+| 한국어 TTS | ✅ 성공 (28초, base_kr.wav 420KB) |
+| OpenVoice 톤 컨버팅 | ✅ 성공 (2초, ref_03s.wav 사용) |
+| **음질** | **❌ 불만족** — "역시 성능이 문제야" |
+
+→ MeloTTS+OpenVoice 조합은 음질이 기대 이하로 폐기.
+
+### 24.3 한국어 로컬 TTS 모델 대규모 탐색
+
+MeloTTS 이외의 회귀 미사용 한국어 로컬 TTS 모덜을 탐색 (librarian 에이전트 4개 병렬).
+
+#### 탐색 결과
+
+| 모델 | 한국어 | 라이선스 | 모델 크기 | 특징 |
+|------|--------|----------|-----------|------|
+| **Qwen3-TTS** | ✅ | Apache 2.0 | 0.6B=1.71GB, 1.7B=3.60GB | 음성 클로닝, 스트리밍, 다국어 |
+| F5-TTS | ✅ | CC-BY-NC-4.0 | ~1.2B | 상업적 제한, 비실시간 |
+| Fish Speech S2 | ✅ | BY-NC-ND-4.0 | ~1B+ | 상업적 제한 |
+| XTTSv2 | ✅ | AGPL-3.0 | ~1.8GB | AGPL 제한 |
+| Bark | ❌ (간헐적) | MIT | ~3B | 한국어 불안정 |
+| VoxCPM2 | ✅ | Apache 2.0 | 미공개 | 중국어 중심 |
+| GPT-SoVITS | ✅ | MIT | ~1B | 파인튜닝 필요 |
+| Chatterbox | ✅ (부분) | MIT | ~0.5B | 영어 중심 |
+| MOSS-TTS-Nano | ❌ | — | 소형 | 중국어만 |
+| FireRedTTS2 | ❌ | — | — | 중국어만 |
+
+#### 양자화 크기 추정 (Qwen3-TTS 0.6B)
+
+| 양자화 | 크기 (Tokenizer 포함) |
+|--------|----------------------|
+| FP32 | ~2.35GB |
+| INT8 | ~1.3GB |
+| INT4 | ~0.9GB |
+
+### 24.4 Qwen3-TTS ONNX 채택
+
+#### 선택 이유
+
+| 항목 | 평가 |
+|------|------|
+| 라이선스 | ✅ Apache 2.0 (상업적 사용 가능) |
+| 한국어 | ✅ 네이티브 지원 |
+| 음성 클로닝 | ✅ 참조 음성으로 화자 모방 |
+| ONNX | ✅ 커뮤니티에서 이미 익스포트 성공 |
+| 스트리밍 | ✅ 97ms TTFA (GPU) |
+| 모바일 | ONNX Runtime Mobile 호환 |
+
+#### 채택한 ONNX 모델
+
+**pltobing/Qwen3-TTS-Streaming-ONNX** (HuggingFace)
+
+- 순수 NumPy + ONNX Runtime (PyTorch 의존 없음)
+- 스트리밍 아키텍처 (prefill + step 분리)
+- 9개 서브모델:
+
+| 서브모델 | 용도 | 크기 (FP32) |
+|----------|------|-------------|
+| talker_model_prefill | Talker LLM prefill | ~1.7GB |
+| talker_model_step | Talker LLM autoregressive step | ~1.7GB |
+| talker_local_model_prefill | Local LLM prefill | — |
+| talker_local_model_step | Local LLM step | — |
+| talker_local_lm_head | Logits 계산 | — |
+| codec_decoder_model | 오디오 디코딩 | — |
+| codec_decoder_model_dynamic_chunks | 스트리밍 디코딩 | — |
+| speaker_encoder_model | 화자 임베딩 | — |
+| talker_codec_embed_model | Codec 토큰 임베딩 | — |
+| text_embed_proj_model | 텍스트 임베딩 프로젝션 | — |
+
+**총 크기**: ~5.3GB (FP32 전체)
+
+### 24.5 Qwen3-TTS ONNX 한국어 TTS 테스트
+
+#### 테스트 환경
+
+| 항목 | 값 |
+|------|-----|
+| 모델 | pltobing/Qwen3-TTS-Streaming-ONNX (FP32) |
+| 실행 | CPU (ORT-GPU 불가: CUDA 11.8 설치, ORT 1.26은 CUDA 12 필요) |
+| 참조 음성 | `ref_03s.wav` (3초) |
+| 언어 | 한국어 |
+
+#### 짧은 문장 테스트
+
+```
+입력: "안녕하세요."
+참조: ref_03s.wav
+```
+
+| 항목 | 값 |
+|------|-----|
+| 오디오 길이 | 1.12초 |
+| 샘플레이트 | 24kHz |
+| TTFA | ~2.9초 |
+| **RTF** | **4.73** (CPU FP32) |
+
+#### 긴 문장 테스트
+
+```
+입력: 한국어 긴 문장 (~7초 분량)
+```
+
+| 항목 | 값 |
+|------|-----|
+| 오디오 길이 | 7.28초 |
+| **RTF** | **4.11** (CPU FP32) |
+| 추론 시간 | 29.94초 |
+
+#### 음질 평가
+
+- ✅ 한국어 발음 정상
+- ✅ 보이스 클로닝 동작 (참조 음성 화자 모방)
+- GPU 모드에서 TTFA 97ms 예상 (CUDA 12 필요)
+
+### 24.6 GPU 모드 제한
+
+```
+onnxruntime-gpu 1.26.0 → CUDA 12 요구
+설치된 CUDA: 11.8
+에러: cublasLt64_12.dll not found
+```
+
+→ CUDA 12 설치 후 TTFA 97ms (스트리밍) 검증 필요.
+
+### 24.7 모바일 전망
+
+| 항목 | 현재 상태 | 모바일 전망 |
+|------|----------|-------------|
+| CPU FP32 RTF | 4.11~4.73 | 모바일 ARM에서 8~15배 예상 → 부적합 |
+| INT4 + NNAPI | 미검증 | RTF 1~2 가능성, 검증 필요 |
+| 스트리밍 TTFA | 97ms (GPU) | 모바일에서 300~500ms 예상 |
+| 모델 크기 | 5.3GB (FP32) | INT4 ~0.9GB, 분산 로딩 가능 |
+
+**다음 단계:**
+1. CUDA 12 설치 → GPU 모드 TTFA 97ms 검증
+2. INT4 양자화 모델 (`wavekat/Qwen3-TTS-0.6B-Base-ONNX`) 테스트
+3. React Native / Flutter ONNX Runtime Mobile 아키텍처 설계
+4. 모바일 성능 벤치마크
+
+### 24.8 파일 구조
+
+```
+qwen3_tts_onnx/
+├── config.json                           — 루트 설정
+├── requirements.txt                      — 의존성 (onnxruntime, numpy 등)
+├── test_qwen3-tts-streaming_onnx.py     — 엔드투엔드 테스트 CLI
+├── configs/
+│   ├── config.json                       — 모델 설정
+│   ├── tokenizer_config.json             — 토크나이저 설정
+│   ├── vocab.json                        — 어휘 사전
+│   ├── merges.txt                        — BPE merges
+│   ├── preprocessor_config.json          — 전처리 설정
+│   └── speech_tokenizer_config.json      — 음성 토크나이저 설정
+├── src/
+│   ├── inference/
+│   │   ├── qwen3_tts_inferencer_onnx.py  — 코어 스트리밍 TTS 엔진
+│   │   └── __init__.py
+│   └── utils/
+│       ├── qwen3_tts_text_processor.py   — 토크나이저 (transformers 독립)
+│       ├── audio_utils.py                — 오디오 유틸
+│       └── __init__.py
+├── qwen3-tts_onnx/                       — ONNX 모델 파일들 (9개, ~5.3GB)
+│   ├── talker_model_prefill.onnx
+│   ├── talker_model_step.onnx
+│   ├── talker_local_model_prefill.onnx
+│   ├── talker_local_model_step.onnx
+│   ├── talker_local_lm_head.onnx
+│   ├── codec_decoder_model.onnx
+│   ├── codec_decoder_model_dynamic_chunks.onnx
+│   ├── speaker_encoder_model.onnx
+│   ├── talker_codec_embed_model.onnx
+│   └── text_embed_proj_model.onnx
+├── audio_ref/                            — 참조 음성 샘플
+├── audio_synth/                          — 합성 결과
+└── logs/                                 — 벤치마크 로그
+
+melotts_test/
+├── test_pipeline.py                      — MeloTTS + OpenVoice 테스트 스크립트
+├── tts_inference.py                      — MeloTTS 추론 래퍼
+├── tone_convert.py                       — OpenVoice 톤 컨버팅
+├── mecab/                                — MeCab-ko 바이너리 + 사전
+├── openvoice_repo/                       — OpenVoice v2 (git clone)
+└── outputs/                              — 합성 결과 (base_kr.wav, converted_kr.wav)
+```
